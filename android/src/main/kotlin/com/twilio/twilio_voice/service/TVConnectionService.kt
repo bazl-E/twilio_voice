@@ -373,7 +373,7 @@ class TVConnectionService : ConnectionService() {
                             }
                         }
                         put(EXTRA_TOKEN, token)
-                        put(EXTRA_CALLER_NAME, outgoingName)
+                        outgoingName?.let { name -> put(EXTRA_CALLER_NAME, name) }
                         if (!rawConnect) {
                             to?.let { v -> put(EXTRA_TO, v) }
                             from?.let { v -> put(EXTRA_FROM, v) }
@@ -562,10 +562,8 @@ class TVConnectionService : ConnectionService() {
             throw Exception("onCreateOutgoingConnection: ACTION_PLACE_OUTGOING_CALL is missing String EXTRA_FROM");
         }
 
-        val outGoingCallerName = myBundle.getString(EXTRA_CALLER_NAME) ?: run {
-            Log.e(TAG, "onCreateOutgoingConnection: ACTION_PLACE_OUTGOING_CALL is missing String EXTRA_FROM")
-            throw Exception("onCreateOutgoingConnection: ACTION_PLACE_OUTGOING_CALL is missing String EXTRA_CALLER_NAME");
-        }
+        // Caller name is optional, use 'to' as fallback if not provided
+        val outGoingCallerName = myBundle.getString(EXTRA_CALLER_NAME) ?: to
 
         // Get all params from bundle
         val params = HashMap<String, String>()
@@ -645,7 +643,10 @@ class TVConnectionService : ConnectionService() {
         connection.setOnCallDisconnected(onCallInitializingDisconnectedListener)
 //        connection.setOnCallEventListener(onEvent)
 
-        // Setup connection UI parameters
+        // Setup connection UI parameters - IMPORTANT: Set address and caller display name BEFORE setInitializing
+        // Some Android devices cache these values and won't update them after the call starts dialing
+        connection.setAddress(Uri.fromParts(PhoneAccount.SCHEME_TEL, to, null), TelecomManager.PRESENTATION_ALLOWED)
+        connection.setCallerDisplayName(outGoingCallerName, TelecomManager.PRESENTATION_ALLOWED)
         connection.setInitializing()
 
         // Apply extras
@@ -703,6 +704,7 @@ class TVConnectionService : ConnectionService() {
      * Apply the given parameters to the given connection. This sets the address, caller display name and subject, any and all if present.
      * @param connection The connection to apply the parameters to.
      * @param params The parameters to apply to the connection.
+     * @param outgoingCallerName The caller display name for outgoing calls (optional).
      */
     private fun <T: TVCallConnection> applyParameters(connection: T, params: TVParameters, outgoingCallerName: String?) {
         params.getExtra(TVParameters.PARAM_SUBJECT, null)?.let {
@@ -710,16 +712,19 @@ class TVConnectionService : ConnectionService() {
         }
         val name = if(connection.callDirection == CallDirection.OUTGOING) params.to else params.from
 
-        val userName =  params.customParameters["client_name"]
+        val userName = params.customParameters["client_name"]
         val userNumber = extractUserNumber(name)
 
         if(connection.callDirection == CallDirection.OUTGOING){
-
+            // For outgoing calls: use the provided caller name, fallback to 'to' number if not provided
+            val displayName = outgoingCallerName?.takeIf { it.isNotEmpty() } ?: name
             connection.setAddress(Uri.fromParts(PhoneAccount.SCHEME_TEL, name, null), TelecomManager.PRESENTATION_ALLOWED)
-            connection.setCallerDisplayName(outgoingCallerName, TelecomManager.PRESENTATION_ALLOWED)
+            connection.setCallerDisplayName(displayName, TelecomManager.PRESENTATION_ALLOWED)
         } else {
+            // For incoming calls: use client_name from customParameters, fallback to extracted user number
+            val displayName = userName?.takeIf { it.isNotEmpty() } ?: userNumber
             connection.setAddress(Uri.fromParts(PhoneAccount.SCHEME_TEL, userNumber, null), TelecomManager.PRESENTATION_ALLOWED)
-            connection.setCallerDisplayName(userName, TelecomManager.PRESENTATION_ALLOWED)
+            connection.setCallerDisplayName(displayName, TelecomManager.PRESENTATION_ALLOWED)
         }
 
     }
