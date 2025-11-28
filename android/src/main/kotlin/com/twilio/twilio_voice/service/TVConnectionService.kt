@@ -373,7 +373,8 @@ class TVConnectionService : ConnectionService() {
                             }
                         }
                         put(EXTRA_TOKEN, token)
-                        put(EXTRA_CALLER_NAME, outgoingName)
+                        // Only add EXTRA_CALLER_NAME if it's not null to avoid null value in bundle
+                        outgoingName?.let { name -> put(EXTRA_CALLER_NAME, name) }
                         if (!rawConnect) {
                             to?.let { v -> put(EXTRA_TO, v) }
                             from?.let { v -> put(EXTRA_FROM, v) }
@@ -563,8 +564,8 @@ class TVConnectionService : ConnectionService() {
         }
 
         val outGoingCallerName = myBundle.getString(EXTRA_CALLER_NAME) ?: run {
-            Log.e(TAG, "onCreateOutgoingConnection: ACTION_PLACE_OUTGOING_CALL is missing String EXTRA_FROM")
-            throw Exception("onCreateOutgoingConnection: ACTION_PLACE_OUTGOING_CALL is missing String EXTRA_CALLER_NAME");
+            Log.w(TAG, "onCreateOutgoingConnection: ACTION_PLACE_OUTGOING_CALL is missing String EXTRA_CALLER_NAME, falling back to 'to' number")
+            to // Fallback to the 'to' number if caller name is not provided
         }
 
         // Get all params from bundle
@@ -650,6 +651,11 @@ class TVConnectionService : ConnectionService() {
 
         // Apply extras
         connection.extras = request.extras
+
+        // Apply caller display name immediately for outgoing calls so it shows during dialing
+        // This sets the initial display name before the call connects/rings
+        connection.setAddress(Uri.fromParts(PhoneAccount.SCHEME_TEL, to, null), TelecomManager.PRESENTATION_ALLOWED)
+        connection.setCallerDisplayName(outGoingCallerName, TelecomManager.PRESENTATION_ALLOWED)
 
         startForegroundService()
 
