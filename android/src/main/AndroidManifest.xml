@@ -88,6 +88,11 @@
             </intent-filter>
         </receiver>
 
+        <!-- Chat reply receiver for inline notification replies -->
+        <receiver
+            android:name=".receivers.ChatReplyReceiver"
+            android:exported="false" />
+
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
