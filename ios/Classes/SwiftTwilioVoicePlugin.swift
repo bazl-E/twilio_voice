@@ -84,7 +84,26 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     var calls: [UUID: Call] = [:]
     /// The UUID of the currently active (foreground) call
     var activeCallUUID: UUID?
-    
+
+    /// True while a CXStartCallAction transaction is pending (between callKitCallController.request()
+    /// being called and its completion block firing). Guards against concurrent makeCall attempts
+    /// (e.g. FCM notification arriving mid-transaction that causes Flutter to call makeCall again
+    /// before the first transaction completes).
+    private var isPendingStartCallTransaction: Bool = false
+
+    /// True once the current callKitProvider has fired providerDidBegin.
+    /// Reset to false each time a fresh CXProvider is created in makeCall.
+    /// Needed because checkRecordPermission fires synchronously (when mic is already
+    /// granted) on the same call stack — before providerDidBegin has had a chance to
+    /// fire on the next run-loop turn. Submitting CXStartCallAction before providerDidBegin
+    /// causes iOS to drop the performStartCallAction dispatch on the second+ call.
+    private var isProviderReady: Bool = false
+
+    /// Outgoing call parameters deferred until providerDidBegin fires.
+    /// Populated when checkRecordPermission callback resolves before the fresh provider
+    /// is ready; drained by providerDidBegin.
+    private var pendingOutgoingCall: (uuid: UUID, handle: String)?
+
     /// Conference mode flag set from Dart via method channel.
     /// When true, incoming calls are silently rejected before any UI is shown.
     var isConferenceMode: Bool = false
@@ -1159,6 +1178,8 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     }
 
     func answerCall(callInvite: CallInvite) {
+        let answerFrom = callInvite.from ?? "unknown"
+        self.sendPhoneCallEvents(description: "LOG|[Twilio] answerCall: uuid=\(callInvite.uuid) from=\(answerFrom)", isError: false)
         let answerCallAction = CXAnswerCallAction(call: callInvite.uuid)
         let transaction = CXTransaction(action: answerCallAction)
 
@@ -1172,6 +1193,18 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
 
     func makeCall(to: String)
     {
+        self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: to=\(to) callInvitesCount=\(callInvites.count) hasActiveCall=\(self.call != nil)", isError: false)
+
+        // Guard against concurrent start-call transactions. A second makeCall can arrive while the
+        // first CXStartCallAction is still in-flight (e.g. FCM notification delivery causes Flutter
+        // to call makeCall again before the first request() completion fires). Submitting two
+        // concurrent CXStartCallAction transactions causes both to be orphaned — neither completion
+        // fires. Skip the second call; Flutter will retry naturally once the first resolves.
+        if isPendingStartCallTransaction || pendingOutgoingCall != nil {
+            self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: SKIPPED — CXStartCallAction already in flight or deferred pending provider ready", isError: false)
+            return
+        }
+
         // Check if there's a pending call invite
         if !self.callInvites.isEmpty {
             self.sendPhoneCallEvents(description: "LOG|Cannot make call - there's a pending incoming call", isError: false)
@@ -1186,7 +1219,35 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
             performEndCallAction(uuid: uuid)
         } else {
             let uuid = UUID()
-            
+
+            // Recreate the CXProvider + CXCallController to guarantee a fresh TUCallCenter
+            // registration before submitting the CXStartCallAction.
+            //
+            // Root cause of error 2 (CXErrorCodeRequestTransactionErrorUnknownCallProvider):
+            // TUCallCenter uses "last writer wins" per handle type. When Vonage calls
+            // setupCallKit() → setDelegate(self), Vonage's provider becomes the owner of
+            // .generic handles, OVERWRITING Twilio's registration. After Vonage's invalidate(),
+            // the .generic slot is EMPTY. Twilio's original CXProvider is now "superseded" —
+            // calling setDelegate(nil/self) on a superseded provider does NOT create a new
+            // TUCallCenter registration; the provider remains orphaned. Only a brand-new
+            // CXProvider object gets a clean, guaranteed registration with TUCallCenter.
+            // This is exactly what Vonage does for every call — we mirror that here.
+            let staleProvider = callKitProvider
+            staleProvider.setDelegate(nil, queue: nil)  
+            let freshConfig = CXProviderConfiguration(localizedName: SwiftTwilioVoicePlugin.appName)
+            freshConfig.maximumCallGroups = 2
+            freshConfig.maximumCallsPerCallGroup = 1
+            freshConfig.supportedHandleTypes = [.phoneNumber, .generic]
+            // Preserve any custom CallKit icon previously set via updateCallKitIcon()
+            if let savedIconName = UserDefaults.standard.string(forKey: defaultCallKitIcon),
+               let iconImage = UIImage(named: savedIconName) {
+                freshConfig.iconTemplateImageData = iconImage.pngData()
+            }
+            callKitProvider = CXProvider(configuration: freshConfig)
+            callKitCallController = CXCallController()
+            callKitProvider.setDelegate(self, queue: nil)
+            self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: fresh CXProvider created (providerDidBegin expected)", isError: false)
+
             self.checkRecordPermission { (permissionGranted) in
                 if (!permissionGranted) {
                     let alertController: UIAlertController = UIAlertController(title: String(format:  NSLocalizedString("mic_permission_title", comment: "") , SwiftTwilioVoicePlugin.appName),
@@ -1376,6 +1437,7 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
             // Ensure custom audio device is set before handling notification
             // Critical for terminated state where the SDK might not have been configured yet
             TwilioVoiceSDK.audioDevice = self.audioDevice
+            self.sendPhoneCallEvents(description: "LOG|[Twilio] VoIP push — calling TwilioVoiceSDK.handleNotification", isError: false)
             TwilioVoiceSDK.handleNotification(payload.dictionaryPayload, delegate: self, delegateQueue: nil)
         }
         
@@ -3311,7 +3373,7 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
 
     // MARK: CXProviderDelegate
     public func providerDidReset(_ provider: CXProvider) {
-        self.sendPhoneCallEvents(description: "LOG|providerDidReset:", isError: false)
+        self.sendPhoneCallEvents(description: "LOG|[Twilio] providerDidReset:", isError: false)
         audioDevice.isEnabled = false
     }
     
@@ -3647,7 +3709,7 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     }
     
     public func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
-        self.sendPhoneCallEvents(description: "LOG|provider:performStartCallAction:", isError: false)
+        self.sendPhoneCallEvents(description: "LOG|[Twilio] provider:performStartCallAction: uuid=\(action.callUUID)", isError: false)
         
         
         provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: Date())
@@ -3843,10 +3905,14 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
         let callHandle = CXHandle(type: .generic, value: handle)
         let startCallAction = CXStartCallAction(call: uuid, handle: callHandle)
         let transaction = CXTransaction(action: startCallAction)
-        
+        self.sendPhoneCallEvents(description: "LOG|[Twilio] requesting CXStartCallAction uuid=\(uuid) handle=\(handle)", isError: false)
+
+        isPendingStartCallTransaction = true
         callKitCallController.request(transaction)  { error in
+            self.isPendingStartCallTransaction = false
             if let error = error {
-                self.sendPhoneCallEvents(description: "LOG|StartCallAction transaction request failed: \(error.localizedDescription)", isError: false)
+                let code = (error as NSError).code
+                self.sendPhoneCallEvents(description: "LOG|StartCallAction transaction request failed: \(error.localizedDescription) (code=\(code) domain=\((error as NSError).domain))", isError: false)
                 return
             }
             
@@ -3866,6 +3932,7 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     }
     
     func reportIncomingCall(from: String, uuid: UUID) {
+        self.sendPhoneCallEvents(description: "LOG|[Twilio] reportIncomingCall: from=\(from) uuid=\(uuid)", isError: false)
         let callHandle = CXHandle(type: .generic, value: from)
         
         let callUpdate = CXCallUpdate()
@@ -3941,6 +4008,7 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     }
     
     func performVoiceCall(uuid: UUID, client: String?, completionHandler: @escaping (Bool) -> Swift.Void) {
+        self.sendPhoneCallEvents(description: "LOG|[Twilio] performVoiceCall: uuid=\(uuid) to=\(self.callTo)", isError: false)
         // Snapshot current audio state BEFORE suppressing so method channel queries
         // during the suppression window return last known good values.
         self.preSuppressAudioRoute = self.getAudioRoute()
