@@ -111,6 +111,16 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     var callKitProvider: CXProvider
     var callKitCallController: CXCallController
     var userInitiatedDisconnect: Bool = false
+    // True when the CXProvider must be recreated before the next outgoing call.
+    // Starts true (first-ever call — no provider registered yet).
+    // Set false after a successful fresh creation in makeCall.
+    // Set true again when:
+    //   • Vonage posts cxProviderInvalidatedNotification (its provider was torn down,
+    //     meaning TUCallCenter's .generic slot is now empty and our provider is orphaned)
+    //   • providerDidReset fires on the current provider (iOS-initiated system reset)
+    // NOT set by slot theft alone — providerDidReset does not fire when Vonage registers
+    // its own CXProvider and silently steals TUCallCenter's .generic slot.
+    private var needsProviderReset: Bool = true
     var callOutgoing: Bool = false
     var outgoingCallerName = ""
 
@@ -218,6 +228,24 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
             name: AVAudioSession.routeChangeNotification,
             object: AVAudioSession.sharedInstance()
         )
+
+        // When Vonage tears down its CXProvider, our existing provider becomes orphaned
+        // (TUCallCenter's .generic slot is now empty). iOS does NOT fire providerDidReset
+        // for slot theft, so we rely on this cross-plugin notification instead.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(onVonageCXProviderInvalidated),
+            name: NSNotification.Name("com.vonage.voice.CXProviderInvalidated"),
+            object: nil
+        )
+    }
+
+    @objc private func onVonageCXProviderInvalidated() {
+        self.sendPhoneCallEvents(
+            description: "LOG|[Twilio] onVonageCXProviderInvalidated: Vonage tore down its CXProvider — marking needsProviderReset=true",
+            isError: false
+        )
+        needsProviderReset = true
     }
     
     /// Configure AVAudioSession to support Bluetooth devices
@@ -1196,43 +1224,50 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
         } else {
             let uuid = UUID()
 
-            // Always create a fresh CXProvider for every outgoing call attempt.
+            // Recreate CXProvider + CXCallController only when our current provider has
+            // been orphaned by Vonage stealing TUCallCenter's .generic slot.
             //
-            // Root cause of Vonage→Twilio error 2 (CXErrorCodeRequestTransactionErrorUnknownCallProvider):
-            // TUCallCenter uses "last writer wins" per handle type. When Vonage calls
-            // setupCallKit() → setDelegate(self) on a new CXProvider, Vonage's provider becomes
-            // the TUCallCenter owner of .generic + .phoneNumber handles, silently orphaning
-            // Twilio's provider. Calling setDelegate(nil/self) on an orphaned provider does NOT
-            // re-register it — only allocating a brand-new CXProvider object gets a guaranteed
-            // clean slot. Vonage does this for every call; Twilio must do the same.
+            // Two distinct scenarios require different strategies:
             //
-            // NOTE: providerDidReset does NOT fire on Twilio's provider when Vonage registers
-            // its own provider. Apple only fires providerDidReset on explicit invalidate() or
-            // system-initiated reset, not on TUCallCenter slot theft. A needsProviderReset flag
-            // gated on providerDidReset therefore never catches the Vonage→Twilio case and was
-            // removed. Always-fresh is the only reliable approach.
+            // (A) Vonage→Twilio: Vonage's setupCallKit() called setDelegate(self) on its own
+            //     CXProvider, which overwrote TUCallCenter's .generic registration for Twilio's
+            //     provider. After Vonage invalidates, the slot is EMPTY. Twilio's original
+            //     CXProvider is orphaned — setDelegate(nil/self) on it does NOT re-register it.
+            //     A brand-new CXProvider object is required. Signal: Vonage posts
+            //     cxProviderInvalidatedNotification, setting needsProviderReset=true.
             //
-            // ORDERING IS CRITICAL — register fresh FIRST, then orphan stale.
-            // If stale is orphaned first there is a brief window where TUCallCenter has no
-            // .generic provider. checkRecordPermission fires synchronously (mic already granted),
-            // so callKitCallController.request() can land in that window: iOS returns "transaction
-            // successful" but performStartCallAction is never dispatched → ghost call.
-            // Registering fresh first closes the window entirely.
-            let staleProvider = callKitProvider
-            let freshConfig = CXProviderConfiguration(localizedName: SwiftTwilioVoicePlugin.appName)
-            freshConfig.maximumCallGroups = 2
-            freshConfig.maximumCallsPerCallGroup = 1
-            freshConfig.supportedHandleTypes = [.phoneNumber, .generic]
-            // Preserve any custom CallKit icon previously set via updateCallKitIcon()
-            if let savedIconName = UserDefaults.standard.string(forKey: defaultCallKitIcon),
-               let iconImage = UIImage(named: savedIconName) {
-                freshConfig.iconTemplateImageData = iconImage.pngData()
+            // (B) Twilio→Twilio: Our CXProvider is still registered with TUCallCenter.
+            //     Creating a fresh one while TUCallCenter still owns the old one causes a
+            //     race: iOS may dispatch performStartCallAction to the old provider during
+            //     the brief transition window, then we orphan the old one — ghost call.
+            //     In this case we REUSE the existing provider to avoid the race entirely.
+            //
+            // ORDERING IS CRITICAL when creating fresh (scenario A):
+            // Register fresh FIRST, then orphan stale. If stale is orphaned first, there is
+            // a brief window where TUCallCenter has no .generic provider. Since
+            // checkRecordPermission fires synchronously (mic already granted), the
+            // callKitCallController.request() can land in that empty window: iOS returns
+            // "transaction successful" but performStartCallAction is never dispatched.
+            if needsProviderReset {
+                let staleProvider = callKitProvider
+                let freshConfig = CXProviderConfiguration(localizedName: SwiftTwilioVoicePlugin.appName)
+                freshConfig.maximumCallGroups = 2
+                freshConfig.maximumCallsPerCallGroup = 1
+                freshConfig.supportedHandleTypes = [.phoneNumber, .generic]
+                // Preserve any custom CallKit icon previously set via updateCallKitIcon()
+                if let savedIconName = UserDefaults.standard.string(forKey: defaultCallKitIcon),
+                   let iconImage = UIImage(named: savedIconName) {
+                    freshConfig.iconTemplateImageData = iconImage.pngData()
+                }
+                callKitProvider = CXProvider(configuration: freshConfig)
+                callKitCallController = CXCallController()
+                callKitProvider.setDelegate(self, queue: nil)  // register fresh FIRST
+                staleProvider.setDelegate(nil, queue: nil)     // then orphan stale — TUCallCenter already updated
+                needsProviderReset = false
+                self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: fresh CXProvider created and registered (needsProviderReset was true)", isError: false)
+            } else {
+                self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: reusing existing CXProvider (sequential Twilio call)", isError: false)
             }
-            callKitProvider = CXProvider(configuration: freshConfig)
-            callKitCallController = CXCallController()
-            callKitProvider.setDelegate(self, queue: nil)  // register fresh FIRST
-            staleProvider.setDelegate(nil, queue: nil)     // then orphan stale — TUCallCenter already updated
-            self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: fresh CXProvider created and registered, stale provider orphaned", isError: false)
 
             self.checkRecordPermission { (permissionGranted) in
                 if (!permissionGranted) {
@@ -3368,8 +3403,9 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
             return
         }
         self.sendPhoneCallEvents(description: "LOG|[Twilio] providerDidReset:", isError: false)
-        // iOS reset the provider (e.g. process handoff, all calls dropped by system).
-        // makeCall always creates a fresh CXProvider, so no flag is needed here.
+        // iOS forcibly reset the provider (e.g. all calls dropped by system).
+        // Mark that the next makeCall must create a fresh CXProvider.
+        needsProviderReset = true
         audioDevice.isEnabled = false
     }
     
