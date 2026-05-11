@@ -86,23 +86,9 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     var activeCallUUID: UUID?
 
     /// True while a CXStartCallAction transaction is pending (between callKitCallController.request()
-    /// being called and its completion block firing). Guards against concurrent makeCall attempts
-    /// (e.g. FCM notification arriving mid-transaction that causes Flutter to call makeCall again
-    /// before the first transaction completes).
+    /// being called and its completion block firing). Tracked for logging only — NOT used to gate
+    /// makeCall, since Twilio supports concurrent calls (conference, attended transfer, etc.).
     private var isPendingStartCallTransaction: Bool = false
-
-    /// True once the current callKitProvider has fired providerDidBegin.
-    /// Reset to false each time a fresh CXProvider is created in makeCall.
-    /// Needed because checkRecordPermission fires synchronously (when mic is already
-    /// granted) on the same call stack — before providerDidBegin has had a chance to
-    /// fire on the next run-loop turn. Submitting CXStartCallAction before providerDidBegin
-    /// causes iOS to drop the performStartCallAction dispatch on the second+ call.
-    private var isProviderReady: Bool = false
-
-    /// Outgoing call parameters deferred until providerDidBegin fires.
-    /// Populated when checkRecordPermission callback resolves before the fresh provider
-    /// is ready; drained by providerDidBegin.
-    private var pendingOutgoingCall: (uuid: UUID, handle: String)?
 
     /// Conference mode flag set from Dart via method channel.
     /// When true, incoming calls are silently rejected before any UI is shown.
@@ -1195,16 +1181,6 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     {
         self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: to=\(to) callInvitesCount=\(callInvites.count) hasActiveCall=\(self.call != nil)", isError: false)
 
-        // Guard against concurrent start-call transactions. A second makeCall can arrive while the
-        // first CXStartCallAction is still in-flight (e.g. FCM notification delivery causes Flutter
-        // to call makeCall again before the first request() completion fires). Submitting two
-        // concurrent CXStartCallAction transactions causes both to be orphaned — neither completion
-        // fires. Skip the second call; Flutter will retry naturally once the first resolves.
-        if isPendingStartCallTransaction || pendingOutgoingCall != nil {
-            self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: SKIPPED — CXStartCallAction already in flight or deferred pending provider ready", isError: false)
-            return
-        }
-
         // Check if there's a pending call invite
         if !self.callInvites.isEmpty {
             self.sendPhoneCallEvents(description: "LOG|Cannot make call - there's a pending incoming call", isError: false)
@@ -1220,20 +1196,29 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
         } else {
             let uuid = UUID()
 
-            // Recreate the CXProvider + CXCallController to guarantee a fresh TUCallCenter
-            // registration before submitting the CXStartCallAction.
+            // Always create a fresh CXProvider for every outgoing call attempt.
             //
-            // Root cause of error 2 (CXErrorCodeRequestTransactionErrorUnknownCallProvider):
+            // Root cause of Vonage→Twilio error 2 (CXErrorCodeRequestTransactionErrorUnknownCallProvider):
             // TUCallCenter uses "last writer wins" per handle type. When Vonage calls
-            // setupCallKit() → setDelegate(self), Vonage's provider becomes the owner of
-            // .generic handles, OVERWRITING Twilio's registration. After Vonage's invalidate(),
-            // the .generic slot is EMPTY. Twilio's original CXProvider is now "superseded" —
-            // calling setDelegate(nil/self) on a superseded provider does NOT create a new
-            // TUCallCenter registration; the provider remains orphaned. Only a brand-new
-            // CXProvider object gets a clean, guaranteed registration with TUCallCenter.
-            // This is exactly what Vonage does for every call — we mirror that here.
+            // setupCallKit() → setDelegate(self) on a new CXProvider, Vonage's provider becomes
+            // the TUCallCenter owner of .generic + .phoneNumber handles, silently orphaning
+            // Twilio's provider. Calling setDelegate(nil/self) on an orphaned provider does NOT
+            // re-register it — only allocating a brand-new CXProvider object gets a guaranteed
+            // clean slot. Vonage does this for every call; Twilio must do the same.
+            //
+            // NOTE: providerDidReset does NOT fire on Twilio's provider when Vonage registers
+            // its own provider. Apple only fires providerDidReset on explicit invalidate() or
+            // system-initiated reset, not on TUCallCenter slot theft. A needsProviderReset flag
+            // gated on providerDidReset therefore never catches the Vonage→Twilio case and was
+            // removed. Always-fresh is the only reliable approach.
+            //
+            // ORDERING IS CRITICAL — register fresh FIRST, then orphan stale.
+            // If stale is orphaned first there is a brief window where TUCallCenter has no
+            // .generic provider. checkRecordPermission fires synchronously (mic already granted),
+            // so callKitCallController.request() can land in that window: iOS returns "transaction
+            // successful" but performStartCallAction is never dispatched → ghost call.
+            // Registering fresh first closes the window entirely.
             let staleProvider = callKitProvider
-            staleProvider.setDelegate(nil, queue: nil)  
             let freshConfig = CXProviderConfiguration(localizedName: SwiftTwilioVoicePlugin.appName)
             freshConfig.maximumCallGroups = 2
             freshConfig.maximumCallsPerCallGroup = 1
@@ -1245,8 +1230,9 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
             }
             callKitProvider = CXProvider(configuration: freshConfig)
             callKitCallController = CXCallController()
-            callKitProvider.setDelegate(self, queue: nil)
-            self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: fresh CXProvider created (providerDidBegin expected)", isError: false)
+            callKitProvider.setDelegate(self, queue: nil)  // register fresh FIRST
+            staleProvider.setDelegate(nil, queue: nil)     // then orphan stale — TUCallCenter already updated
+            self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: fresh CXProvider created and registered, stale provider orphaned", isError: false)
 
             self.checkRecordPermission { (permissionGranted) in
                 if (!permissionGranted) {
@@ -3373,7 +3359,17 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
 
     // MARK: CXProviderDelegate
     public func providerDidReset(_ provider: CXProvider) {
+        // Guard against the stale provider firing providerDidReset when we call
+        // staleProvider.setDelegate(nil) during makeCall. Without this, the stale
+        // provider's reset would disable the audio device right as the fresh
+        // provider is being set up, silencing audio on the second call.
+        guard provider === callKitProvider else {
+            self.sendPhoneCallEvents(description: "LOG|[Twilio] providerDidReset: IGNORED (stale provider)", isError: false)
+            return
+        }
         self.sendPhoneCallEvents(description: "LOG|[Twilio] providerDidReset:", isError: false)
+        // iOS reset the provider (e.g. process handoff, all calls dropped by system).
+        // makeCall always creates a fresh CXProvider, so no flag is needed here.
         audioDevice.isEnabled = false
     }
     
@@ -3700,6 +3696,12 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     }
 
     public func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        // Only act on the active provider — the stale provider may fire this during
+        // its cleanup and would otherwise kill audio mid-call on the fresh provider.
+        guard provider === callKitProvider else {
+            self.sendPhoneCallEvents(description: "LOG|provider:didDeactivateAudioSession: IGNORED (stale provider)", isError: false)
+            return
+        }
         self.sendPhoneCallEvents(description: "LOG|provider:didDeactivateAudioSession:", isError: false)
         audioDevice.isEnabled = false
     }
