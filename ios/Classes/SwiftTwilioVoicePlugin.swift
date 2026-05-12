@@ -242,10 +242,28 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
 
     @objc private func onVonageCXProviderInvalidated() {
         self.sendPhoneCallEvents(
-            description: "LOG|[Twilio] onVonageCXProviderInvalidated: Vonage tore down its CXProvider — marking needsProviderReset=true",
+            description: "LOG|[Twilio] onVonageCXProviderInvalidated: Vonage CXProvider torn down — deferring reset check",
             isError: false
         )
-        needsProviderReset = true
+        // FIX: Do NOT set needsProviderReset immediately if a Twilio call is active.
+        // Recreating the CXProvider mid-call destroys all UUID associations and
+        // breaks the hangup path. Defer by 500ms and only mark reset if no call
+        // is in progress (covers stale Vonage push arriving during an active call).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self else { return }
+            if self.call == nil && self.callInvites.isEmpty {
+                self.needsProviderReset = true
+                self.sendPhoneCallEvents(
+                    description: "LOG|[Twilio] onVonageCXProviderInvalidated: no active Twilio call — marking needsProviderReset=true",
+                    isError: false
+                )
+            } else {
+                self.sendPhoneCallEvents(
+                    description: "LOG|[Twilio] onVonageCXProviderInvalidated: Twilio call active (calls=\(self.calls.count)) — skipping provider reset",
+                    isError: false
+                )
+            }
+        }
     }
     
     /// Configure AVAudioSession to support Bluetooth devices
@@ -1727,6 +1745,26 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     
     // MARK: TVOCallDelegate
     public func callDidStartRinging(call: Call) {
+        // FIX: Migrate placeholder UUID to the real UUID assigned by the Twilio SDK.
+        // When an outgoing call transitions to ringing, iOS CallKit merges the local
+        // placeholder UUID (created in makeCall) into the SID-based UUID. The
+        // callObserver:callChanged: fires to update activeCXCalls with the new UUID,
+        // but self.calls is still keyed by the old placeholder. Sync them here so
+        // hangUp → performEndCallAction → CXProvider delegate can find the call.
+        if let newUUID = call.uuid, newUUID != self.activeCallUUID {
+            let oldUUID = self.activeCallUUID
+            let oldUUIDStr = oldUUID?.uuidString ?? "nil"
+            if let old = oldUUID {
+                self.calls.removeValue(forKey: old)
+            }
+            self.calls[newUUID] = call
+            self.activeCallUUID = newUUID
+            self.sendPhoneCallEvents(
+                description: "LOG|callDidStartRinging: UUID migrated \(oldUUIDStr) -> \(newUUID)",
+                isError: false
+            )
+        }
+
         let direction = (self.callOutgoing ? "Outgoing" : "Incoming")
         let from = self.callOutgoing ? call.from ?? self.identity : extractUserNumber(from: (call.from ?? ""))
         let to = (call.to ?? self.callTo)
@@ -1755,6 +1793,15 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
 
         // Track this call as the active call
         if let uuid = call.uuid {
+            // FIX: Remove stale placeholder key if the UUID changed during session merge
+            // (safety net in case callDidStartRinging was skipped or UUID differs).
+            if let oldUUID = self.activeCallUUID, oldUUID != uuid {
+                self.calls.removeValue(forKey: oldUUID)
+                self.sendPhoneCallEvents(
+                    description: "LOG|callDidConnect: cleaned up stale UUID \(oldUUID) → \(uuid)",
+                    isError: false
+                )
+            }
             self.activeCallUUID = uuid
             self.calls[uuid] = call
         }
@@ -3835,6 +3882,21 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
         } else if let call = self.calls[action.callUUID] {
             self.sendPhoneCallEvents(description: "LOG|provider:performEndCallAction: disconnecting call", isError: false)
             call.disconnect()
+        } else if let fallbackCall = self.calls.values.first(where: { $0.uuid == action.callUUID }) {
+            // FIX: UUID key mismatch after CallKit session merge — find call by value scan.
+            self.sendPhoneCallEvents(
+                description: "LOG|provider:performEndCallAction: UUID key mismatch, disconnecting via value scan",
+                isError: false
+            )
+            fallbackCall.disconnect()
+        } else if self.calls.count == 1, let lastCall = self.calls.values.first {
+            // FIX: Last resort — only one call exists and UUID lookup failed entirely.
+            // Disconnect it so the user is never stuck on a live call.
+            self.sendPhoneCallEvents(
+                description: "LOG|provider:performEndCallAction: last-resort disconnect of sole remaining call",
+                isError: false
+            )
+            lastCall.disconnect()
         } else {
             self.sendPhoneCallEvents(description: "LOG|provider:performEndCallAction: no call or invite found for uuid", isError: false)
         }
