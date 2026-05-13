@@ -55,14 +55,14 @@ Future<Result?> generateURLAccessToken(String url) async {
 Future<Result?> generateFirebaseAccessToken() async {
   printDebug("voip-registtering with token ");
   printDebug("voip-calling voice-accessToken");
-  final function = FirebaseFunctions.instance.httpsCallable("voice-accessToken");
+  final function =
+      FirebaseFunctions.instance.httpsCallable("voice-accessToken");
 
   final params = {
     "platform": Platform.isIOS ? "iOS" : "Android",
   };
 
   final result = await function.call(params);
-
 
   final data = jsonDecode(result.data);
   final identity = data["identity"] as String?;

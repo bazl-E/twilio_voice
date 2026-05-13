@@ -105,25 +105,25 @@ class _AppState extends State<App> {
 
     // Use for locally provided token generator e.g. Twilio's quickstarter project: https://github.com/twilio/voice-quickstart-server-node
     // if (!kIsWeb) {
-      bool success = false;
-      // if not web, we use the requested registration method
-      switch (widget.registrationMethod) {
-        case RegistrationMethod.env:
-          success = await _registerFromEnvironment();
-          break;
-        case RegistrationMethod.url:
-          success = await _registerUrl();
-          break;
-        case RegistrationMethod.firebase:
-          success = await _registerFirebase();
-          break;
-      }
+    bool success = false;
+    // if not web, we use the requested registration method
+    switch (widget.registrationMethod) {
+      case RegistrationMethod.env:
+        success = await _registerFromEnvironment();
+        break;
+      case RegistrationMethod.url:
+        success = await _registerUrl();
+        break;
+      case RegistrationMethod.firebase:
+        success = await _registerFirebase();
+        break;
+    }
 
-      if (success) {
-        setState(() {
-          twilioInit = true;
-        });
-      }
+    if (success) {
+      setState(() {
+        twilioInit = true;
+      });
+    }
     // } else {
     //   // for web, we always show the initialisation screen unless we specified an
     //   if (widget.registrationMethod == RegistrationMethod.env) {

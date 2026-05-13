@@ -16,7 +16,12 @@ class UICallScreen extends StatefulWidget {
   final PerformCall onPerformCall;
   final PerformCall? onCallToQueue;
 
-  const UICallScreen({Key? key, required this.userId, required this.onPerformCall, this.onCallToQueue}) : super(key: key);
+  const UICallScreen(
+      {Key? key,
+      required this.userId,
+      required this.onPerformCall,
+      this.onCallToQueue})
+      : super(key: key);
 
   @override
   State<UICallScreen> createState() => _UICallScreenState();
@@ -24,7 +29,8 @@ class UICallScreen extends StatefulWidget {
 
 class _UICallScreenState extends State<UICallScreen> {
   late TextEditingController _controller;
-  late final GlobalKey<FormFieldState<String>> _identifierKey = GlobalKey<FormFieldState<String>>();
+  late final GlobalKey<FormFieldState<String>> _identifierKey =
+      GlobalKey<FormFieldState<String>>();
   bool _copied = false;
 
   String _getRecipientIdFromEnv() {
@@ -62,7 +68,8 @@ class _UICallScreenState extends State<UICallScreen> {
             }
             return null;
           },
-          decoration: const InputDecoration(labelText: 'Client Identifier or Phone Number'),
+          decoration: const InputDecoration(
+              labelText: 'Client Identifier or Phone Number'),
         ),
         const SizedBox(height: 10),
         Wrap(
@@ -71,7 +78,9 @@ class _UICallScreenState extends State<UICallScreen> {
             const SizedBox(width: 8),
             GestureDetector(
               onTap: () => _copyToClipboard(widget.userId),
-              child: _copied ? const Icon(Icons.check, color: Colors.green, size: 16) : const Icon(Icons.copy, size: 16),
+              child: _copied
+                  ? const Icon(Icons.check, color: Colors.green, size: 16)
+                  : const Icon(Icons.copy, size: 16),
             ),
           ],
         ),
@@ -117,7 +126,8 @@ class _UICallScreenState extends State<UICallScreen> {
         Expanded(
           child: Column(
             children: [
-              Text("Events (latest at top)", style: Theme.of(context).textTheme.titleLarge),
+              Text("Events (latest at top)",
+                  style: Theme.of(context).textTheme.titleLarge),
               const TwilioLog(),
             ],
           ),
@@ -149,7 +159,8 @@ class _RingSoundState extends State<_RingSound> {
               controller: _controller,
               decoration: InputDecoration(
                 labelText: "Enter custom url sound (mp3)",
-                hintText: "https://sdk.twilio.com/js/client/sounds/releases/1.0.0/incoming.mp3",
+                hintText:
+                    "https://sdk.twilio.com/js/client/sounds/releases/1.0.0/incoming.mp3",
                 suffix: IconButton(
                   icon: const Icon(Icons.clear),
                   onPressed: () {
@@ -166,7 +177,9 @@ class _RingSoundState extends State<_RingSound> {
               await _tv.updateSound(SoundName.Incoming, url);
               // ignore: use_build_context_synchronously
               ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text("Updated incoming sound to ${_controller.text}")),
+                SnackBar(
+                    content:
+                        Text("Updated incoming sound to ${_controller.text}")),
               );
             },
             child: const Text("Update"),
