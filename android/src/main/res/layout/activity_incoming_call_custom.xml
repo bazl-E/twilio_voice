@@ -85,6 +85,119 @@
             android:gravity="center_horizontal"
             android:layout_marginTop="4dp" />
 
+        <!-- Transfer Info Card (visible only for transferred calls) -->
+        <LinearLayout
+            android:id="@+id/transferInfoCard"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginTop="14dp"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="10dp"
+            android:background="@drawable/transfer_info_card_bg"
+            android:visibility="gone">
+
+            <!-- "Transferred call" badge row -->
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="6dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="↩ Transferred Call"
+                    android:textSize="11sp"
+                    android:textColor="#A78BFA"
+                    android:textStyle="bold"
+                    android:letterSpacing="0.04" />
+
+            </LinearLayout>
+
+            <!-- Agent name row -->
+            <LinearLayout
+                android:id="@+id/transferAgentRow"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="2dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="From: "
+                    android:textSize="12sp"
+                    android:textColor="#A1A1AA" />
+
+                <TextView
+                    android:id="@+id/transferAgentName"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textSize="12sp"
+                    android:textColor="#FFFFFF"
+                    android:textStyle="bold" />
+
+            </LinearLayout>
+
+            <!-- Note row -->
+            <LinearLayout
+                android:id="@+id/transferNoteRow"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="2dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Note: "
+                    android:textSize="12sp"
+                    android:textColor="#A1A1AA" />
+
+                <TextView
+                    android:id="@+id/transferNote"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textSize="12sp"
+                    android:textColor="#E4E4E7"
+                    android:maxLines="2"
+                    android:ellipsize="end" />
+
+            </LinearLayout>
+
+            <!-- Contact number row -->
+            <LinearLayout
+                android:id="@+id/transferContactRow"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Contact: "
+                    android:textSize="12sp"
+                    android:textColor="#A1A1AA" />
+
+                <TextView
+                    android:id="@+id/transferContactNumber"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textSize="12sp"
+                    android:textColor="#E4E4E7" />
+
+            </LinearLayout>
+
+        </LinearLayout>
+
     </LinearLayout>
 
     <!-- Spacer (Minimized between caller info and avatar) -->

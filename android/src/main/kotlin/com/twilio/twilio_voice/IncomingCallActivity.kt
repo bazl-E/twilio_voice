@@ -83,6 +83,11 @@ class IncomingCallActivity : AppCompatActivity() {
         const val EXTRA_ACTIVE_CALLER_NAME = "EXTRA_ACTIVE_CALLER_NAME"
         const val EXTRA_ACTIVE_CALLER_NUMBER = "EXTRA_ACTIVE_CALLER_NUMBER"
         const val EXTRA_ACTIVE_CALL_HANDLE = "EXTRA_ACTIVE_CALL_HANDLE"
+        // Transfer call extras
+        const val EXTRA_IS_TRANSFERRED = "EXTRA_IS_TRANSFERRED"
+        const val EXTRA_TRANSFER_AGENT_NAME = "EXTRA_TRANSFER_AGENT_NAME"
+        const val EXTRA_TRANSFER_NOTE = "EXTRA_TRANSFER_NOTE"
+        const val EXTRA_TRANSFER_CONTACT_NUMBER = "EXTRA_TRANSFER_CONTACT_NUMBER"
         const val EXTRA_WAS_APP_IN_FOREGROUND = "EXTRA_WAS_APP_IN_FOREGROUND"
         private const val REQUEST_RECORD_AUDIO_PERMISSION = 200
 
@@ -116,6 +121,15 @@ class IncomingCallActivity : AppCompatActivity() {
                 val callerNumber = extractUserNumber(callInvite.from ?: "Unknown")
                 putExtra(EXTRA_CALLER_NAME, callerName)
                 putExtra(EXTRA_CALLER_NUMBER, callerNumber)
+
+                // Extract transfer metadata (present only when this call was transferred)
+                val isTransferred = callInvite.customParameters.containsKey("transfer_host")
+                putExtra(EXTRA_IS_TRANSFERRED, isTransferred)
+                if (isTransferred) {
+                    putExtra(EXTRA_TRANSFER_AGENT_NAME, callInvite.customParameters["user_name"] ?: "")
+                    putExtra(EXTRA_TRANSFER_NOTE, callInvite.customParameters["note"] ?: "")
+                    putExtra(EXTRA_TRANSFER_CONTACT_NUMBER, callInvite.customParameters["contact_number"] ?: "")
+                }
             }
         }
 
@@ -132,6 +146,12 @@ class IncomingCallActivity : AppCompatActivity() {
     private var callerNumber: String? = null
     private var myNumber: String? = null  // The number receiving the call (to)
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // Transfer call state
+    private var isTransferred: Boolean = false
+    private var transferAgentName: String? = null
+    private var transferNote: String? = null
+    private var transferContactNumber: String? = null
     
     // Call waiting state - active call info when this is a second incoming call
     private var hasActiveCall = false
@@ -402,15 +422,21 @@ class IncomingCallActivity : AppCompatActivity() {
         callSid = intent.getStringExtra(EXTRA_CALL_SID)
         callerName = intent.getStringExtra(EXTRA_CALLER_NAME) ?: "Unknown"
         callerNumber = intent.getStringExtra(EXTRA_CALLER_NUMBER) ?: ""
-        
+
         // Extract the "to" number (the number receiving the call)
         myNumber = callInvite?.to ?: ""
-        
+
         // Get active call info (call waiting scenario)
         hasActiveCall = intent.getBooleanExtra(EXTRA_HAS_ACTIVE_CALL, false)
         activeCallerName = intent.getStringExtra(EXTRA_ACTIVE_CALLER_NAME)
         activeCallerNumber = intent.getStringExtra(EXTRA_ACTIVE_CALLER_NUMBER)
         activeCallHandle = intent.getStringExtra(EXTRA_ACTIVE_CALL_HANDLE)
+
+        // Transfer call metadata
+        isTransferred = intent.getBooleanExtra(EXTRA_IS_TRANSFERRED, false)
+        transferAgentName = intent.getStringExtra(EXTRA_TRANSFER_AGENT_NAME)
+        transferNote = intent.getStringExtra(EXTRA_TRANSFER_NOTE)
+        transferContactNumber = intent.getStringExtra(EXTRA_TRANSFER_CONTACT_NUMBER)
         
         // The PendingIntent extras are baked at notification-creation time.
         // If the active call ended before the user tapped the notification,
@@ -432,6 +458,9 @@ class IncomingCallActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.callerName).text = callerName
         val formattedNumber = formatPhoneNumber(callerNumber)
         findViewById<TextView>(R.id.callerNumber).text = if (formattedNumber.isNotEmpty()) "Mobile  $formattedNumber" else "Mobile"
+
+        // Bind transfer info card
+        bindTransferInfoCard()
 
         // Load Easify logo from Flutter assets using SvgPicture-like approach
         // For now, keep the vector drawable but make it more visible
@@ -2216,6 +2245,46 @@ class IncomingCallActivity : AppCompatActivity() {
             }
             // Default: return original if format doesn't match
             else -> phoneNumber
+        }
+    }
+
+    private fun bindTransferInfoCard() {
+        val card = findViewById<android.view.View>(R.id.transferInfoCard) ?: return
+        if (!isTransferred) {
+            card.visibility = android.view.View.GONE
+            return
+        }
+        card.visibility = android.view.View.VISIBLE
+
+        val agentRow = findViewById<android.view.View>(R.id.transferAgentRow)
+        val agentNameView = findViewById<TextView>(R.id.transferAgentName)
+        val noteRow = findViewById<android.view.View>(R.id.transferNoteRow)
+        val noteView = findViewById<TextView>(R.id.transferNote)
+        val contactRow = findViewById<android.view.View>(R.id.transferContactRow)
+        val contactView = findViewById<TextView>(R.id.transferContactNumber)
+
+        val agentName = transferAgentName?.takeIf { it.isNotEmpty() }
+        if (agentName != null) {
+            agentNameView.text = agentName
+            agentRow.visibility = android.view.View.VISIBLE
+        } else {
+            agentRow.visibility = android.view.View.GONE
+        }
+
+        val note = transferNote?.takeIf { it.isNotEmpty() }
+        if (note != null) {
+            noteView.text = note
+            noteRow.visibility = android.view.View.VISIBLE
+        } else {
+            noteRow.visibility = android.view.View.GONE
+        }
+
+        val contact = transferContactNumber?.takeIf { it.isNotEmpty() }
+        if (contact != null) {
+            contactView.text = contact
+            contactRow.visibility = android.view.View.VISIBLE
+        } else {
+            contactRow.visibility = android.view.View.GONE
         }
     }
 }
