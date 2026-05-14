@@ -144,7 +144,20 @@ class IncomingCallActivity : AppCompatActivity() {
     private var callSid: String? = null
     private var callerName: String? = null
     private var callerNumber: String? = null
-    private var myNumber: String? = null  // The number receiving the call (to)
+    private var myNumber: String? = null  // Twilio client identity that received the call (callInvite.to)
+    /**
+     * The real E.164 phone number that the caller dialled — i.e. *our* phone number
+     * as it appears in the backend's phone-numbers table.
+     *
+     * Background: Twilio sets [callInvite.to] to the Twilio client identity string
+     * (e.g. "client:fayiz_e1772527748"), NOT the actual DID/phone number. The
+     * backend injects the real number as a custom parameter ["callee"] so that
+     * features like transfer-call can send `from=<real phone number>` to the API
+     * without a separate lookup.
+     *
+     * Example: customParameters=[callee=+16076021951, client_name=Cy one FN, ...]
+     */
+    private var myCalleeNumber: String? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     // Transfer call state
@@ -423,8 +436,22 @@ class IncomingCallActivity : AppCompatActivity() {
         callerName = intent.getStringExtra(EXTRA_CALLER_NAME) ?: "Unknown"
         callerNumber = intent.getStringExtra(EXTRA_CALLER_NUMBER) ?: ""
 
-        // Extract the "to" number (the number receiving the call)
+        // Log all customParameters so we can see what the backend sends
+        val customParamsLog = callInvite?.customParameters
+            ?.entries
+            ?.joinToString(", ") { "${it.key}=${it.value}" }
+            ?: "null"
+        android.util.Log.d(TAG, "onCreate: callInvite.customParameters=[$customParamsLog]")
+
+        // Extract the "to" identity (Twilio client identity, e.g. "client:fayiz_...").
+        // This is NOT a phone number — it is only used internally to identify the agent.
         myNumber = callInvite?.to ?: ""
+
+        // Extract the real E.164 phone number for this agent from the backend-injected
+        // custom parameter "callee" (e.g. "+16076021951").
+        // This is the number we must pass as `from` in the transfer-call API.
+        myCalleeNumber = callInvite?.customParameters?.get("callee")?.takeIf { it.isNotBlank() }
+        android.util.Log.d(TAG, "onCreate: myNumber(identity)=$myNumber, myCalleeNumber(E.164)=$myCalleeNumber")
 
         // Get active call info (call waiting scenario)
         hasActiveCall = intent.getBooleanExtra(EXTRA_HAS_ACTIVE_CALL, false)
@@ -1750,6 +1777,8 @@ class IncomingCallActivity : AppCompatActivity() {
             "callerName" to callerName,
             "callerNumber" to callerNumber,
             "myNumber" to myNumber,
+            // Real E.164 DID that was called — used as `from` in transfer-call API
+            "myCalleeNumber" to myCalleeNumber,
             "callSid" to callSid,
             "callDirection" to "incoming",
             "isCallAnswered" to true
@@ -1931,6 +1960,7 @@ class IncomingCallActivity : AppCompatActivity() {
             it.putExtra("CALLER_NAME", callerName)
             it.putExtra("CALLER_NUMBER", callerNumber)
             it.putExtra("MY_NUMBER", myNumber)
+            it.putExtra("MY_CALLEE_NUMBER", myCalleeNumber)
             it.putExtra("CALL_DIRECTION", "incoming")
             startActivity(it)
             android.util.Log.d(TAG, "launchMainActivityForCallWaiting: Brought main activity to front (UNLOCKED path) - caller: $callerName, number: $callerNumber")
@@ -1955,9 +1985,11 @@ class IncomingCallActivity : AppCompatActivity() {
             it.putExtra("CALLER_NAME", callerName)
             it.putExtra("CALLER_NUMBER", callerNumber)
             it.putExtra("MY_NUMBER", myNumber)
+            // Real E.164 DID that was called — used as `from` in transfer-call API
+            it.putExtra("MY_CALLEE_NUMBER", myCalleeNumber)
             it.putExtra("CALL_DIRECTION", "incoming")
             startActivity(it)
-            android.util.Log.d(TAG, "launchMainActivity: Launched with call data (UNLOCKED path) - caller: $callerName, number: $callerNumber, myNumber: $myNumber")
+            android.util.Log.d(TAG, "launchMainActivity: Launched with call data (UNLOCKED path) - caller: $callerName, number: $callerNumber, myNumber: $myNumber, myCalleeNumber: $myCalleeNumber")
         }
     }
 
