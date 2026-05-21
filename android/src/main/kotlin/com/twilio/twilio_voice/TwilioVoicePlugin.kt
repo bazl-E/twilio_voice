@@ -2618,7 +2618,14 @@ class TwilioVoicePlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamH
 
                 // Check if there's already an active call
                 if (callSid != null) {
-                    // Active call exists - don't overwrite callSid or send Ringing
+                    // Deduplicate: if this broadcast is for the SAME call that is already
+                    // tracked, it is a stale/duplicate delivery (e.g., async LocalBroadcast
+                    // arriving after onCreateIncomingConnection race). Ignore it silently.
+                    if (callHandle == callSid) {
+                        Log.d(TAG, "handleBroadcastIntent: ACTION_INCOMING_CALL duplicate for same SID ($callSid), ignoring")
+                        return
+                    }
+                    // Different SID = genuine second incoming call while another is active.
                     // Send a separate event so Flutter can track the waiting call
                     // without corrupting the active call's data
                     Log.d(TAG, "handleBroadcastIntent: ACTION_INCOMING_CALL during active call (callSid=$callSid), sending IncomingWhileActive for $callHandle")

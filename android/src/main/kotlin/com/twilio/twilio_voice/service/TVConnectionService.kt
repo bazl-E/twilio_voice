@@ -2244,8 +2244,10 @@ class TVConnectionService : ConnectionService() {
         }
         connection.setOnCallDisconnected(onCallDisconnectedListener)
 
-        // Notify Flutter about the incoming call
-        sendBroadcastEvent(applicationContext, TVBroadcastReceiver.ACTION_INCOMING_CALL, callSid, connection.extras)
+        // NOTE: The ACTION_INCOMING_CALL broadcast (with EXTRA_CALL_INVITE) is already
+        // sent by VoiceFirebaseMessagingService.onCallInvite BEFORE this method fires.
+        // Do NOT send a second broadcast here — it would trigger a false IncomingWhileActive
+        // for the same call SID since callSid is already set in TwilioVoicePlugin by then.
         sendBroadcastCallHandle(applicationContext, callSid)
 
         Log.d(TAG, "[onCreateIncomingConnection-$shortSid] Connection created and returned to TelecomManager")
@@ -2333,7 +2335,9 @@ class TVConnectionService : ConnectionService() {
         }
         connection.setOnCallDisconnected(onCallDisconnectedListener)
 
-        sendBroadcastEvent(applicationContext, TVBroadcastReceiver.ACTION_INCOMING_CALL, callSid, connection.extras)
+        // NOTE: The ACTION_INCOMING_CALL broadcast (with EXTRA_CALL_INVITE) is already sent
+        // by VoiceFirebaseMessagingService.onCallInvite before this fallback path runs.
+        // Sending it again here would cause a false IncomingWhileActive for the same call.
         sendBroadcastCallHandle(applicationContext, callSid)
         Log.d(TAG, "[createIncomingConnectionDirectly-$shortSid] Connection created (fallback complete)")
     }
