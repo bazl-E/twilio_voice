@@ -1476,10 +1476,12 @@ class TVConnectionService : ConnectionService() {
                                     // normally → MainActivity.onResume() picks it up and
                                     // navigates to the active call screen.
                                     Log.d(TAG, "ACTION_ANSWER: Device is locked - storing pendingAnsweredCallData instead of launching MainActivity")
+                                    val myCalleeNumber = callInvite.customParameters["callee"]?.takeIf { it.isNotBlank() }
                                     IncomingCallActivity.pendingAnsweredCallData = mapOf(
                                         "callerName" to callerNumber,
                                         "callerNumber" to callerNumber,
                                         "myNumber" to myNumber,
+                                        "myCalleeNumber" to myCalleeNumber,
                                         "callSid" to callSid,
                                         "callDirection" to "incoming",
                                         "isCallAnswered" to true
@@ -1496,12 +1498,14 @@ class TVConnectionService : ConnectionService() {
                                         intent.putExtra("callAnswered", true)
                                         intent.putExtra("CALL_ANSWERED", true)
                                         intent.putExtra("CALL_SID", callSid)
+                                        val myCalleeNumber = callInvite.customParameters["callee"]?.takeIf { it.isNotBlank() }
                                         intent.putExtra("CALLER_NAME", callerNumber)
                                         intent.putExtra("CALLER_NUMBER", callerNumber)
                                         intent.putExtra("MY_NUMBER", myNumber)
+                                        intent.putExtra("MY_CALLEE_NUMBER", myCalleeNumber)
                                         intent.putExtra("CALL_DIRECTION", "incoming")
                                         startActivity(intent)
-                                        Log.d(TAG, "ACTION_ANSWER: Launched main activity (UNLOCKED path) - caller: $callerNumber")
+                                        Log.d(TAG, "ACTION_ANSWER: Launched main activity (UNLOCKED path) - caller: $callerNumber, myCalleeNumber: $myCalleeNumber")
                                     }
                                 }
                             } catch (e: Exception) {
@@ -2847,10 +2851,12 @@ class TVConnectionService : ConnectionService() {
                         Log.d(TAG, "[onAnswerCallback-$callSid] Device locked — storing pendingAnsweredCallData")
                         val callerNumber = extractUserNumber(connection.callInvite.from ?: "")
                         val myNumber = connection.callInvite.to ?: ""
+                        val myCalleeNumber = connection.callInvite.customParameters["callee"]?.takeIf { it.isNotBlank() }
                         IncomingCallActivity.pendingAnsweredCallData = mapOf(
                             "callerName" to callerNumber,
                             "callerNumber" to callerNumber,
                             "myNumber" to myNumber,
+                            "myCalleeNumber" to myCalleeNumber,
                             "callSid" to callSid,
                             "callDirection" to "incoming",
                             "isCallAnswered" to true
@@ -2860,6 +2866,7 @@ class TVConnectionService : ConnectionService() {
                         launchIntent?.let { intent ->
                             val callerNumber = extractUserNumber(connection.callInvite.from ?: "")
                             val myNumber = connection.callInvite.to ?: ""
+                            val myCalleeNumber = connection.callInvite.customParameters["callee"]?.takeIf { it.isNotBlank() }
                             intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or
                                     Intent.FLAG_ACTIVITY_SINGLE_TOP or
                                     Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
@@ -2871,9 +2878,10 @@ class TVConnectionService : ConnectionService() {
                             intent.putExtra("CALLER_NAME", callerNumber)
                             intent.putExtra("CALLER_NUMBER", callerNumber)
                             intent.putExtra("MY_NUMBER", myNumber)
+                            intent.putExtra("MY_CALLEE_NUMBER", myCalleeNumber)
                             intent.putExtra("CALL_DIRECTION", "incoming")
                             startActivity(intent)
-                            Log.d(TAG, "[onAnswerCallback-$callSid] Launched MainActivity (UNLOCKED path)")
+                            Log.d(TAG, "[onAnswerCallback-$callSid] Launched MainActivity (UNLOCKED path), myCalleeNumber=$myCalleeNumber")
                         }
                     }
                 } catch (e: Exception) {
@@ -4096,7 +4104,7 @@ class TVConnectionService : ConnectionService() {
         }
     }
     
-    private fun launchMainActivityWithCallData(callSid: String, callerNumber: String, myNumber: String) {
+    private fun launchMainActivityWithCallData(callSid: String, callerNumber: String, myNumber: String, myCalleeNumber: String? = null) {
         try {
             // ARCHITECTURE: MainActivity NEVER shows over lock screen.
             // If locked, skip launch — pendingAnsweredCallData was already stored
@@ -4125,9 +4133,10 @@ class TVConnectionService : ConnectionService() {
                 intent.putExtra("CALLER_NAME", callerNumber)
                 intent.putExtra("CALLER_NUMBER", callerNumber)
                 intent.putExtra("MY_NUMBER", myNumber)
+                intent.putExtra("MY_CALLEE_NUMBER", myCalleeNumber)
                 intent.putExtra("CALL_DIRECTION", "incoming")
                 startActivity(intent)
-                Log.d(TAG, "launchMainActivityWithCallData: Launched (UNLOCKED path) with caller=$callerNumber")
+                Log.d(TAG, "launchMainActivityWithCallData: Launched (UNLOCKED path) with caller=$callerNumber, myCalleeNumber=$myCalleeNumber")
             }
         } catch (e: Exception) {
             Log.w(TAG, "launchMainActivityWithCallData: Failed: ${e.message}")

@@ -83,6 +83,11 @@ class IncomingCallActivity : AppCompatActivity() {
         const val EXTRA_ACTIVE_CALLER_NAME = "EXTRA_ACTIVE_CALLER_NAME"
         const val EXTRA_ACTIVE_CALLER_NUMBER = "EXTRA_ACTIVE_CALLER_NUMBER"
         const val EXTRA_ACTIVE_CALL_HANDLE = "EXTRA_ACTIVE_CALL_HANDLE"
+        // Transfer call extras
+        const val EXTRA_IS_TRANSFERRED = "EXTRA_IS_TRANSFERRED"
+        const val EXTRA_TRANSFER_AGENT_NAME = "EXTRA_TRANSFER_AGENT_NAME"
+        const val EXTRA_TRANSFER_NOTE = "EXTRA_TRANSFER_NOTE"
+        const val EXTRA_TRANSFER_CONTACT_NUMBER = "EXTRA_TRANSFER_CONTACT_NUMBER"
         const val EXTRA_WAS_APP_IN_FOREGROUND = "EXTRA_WAS_APP_IN_FOREGROUND"
         private const val REQUEST_RECORD_AUDIO_PERMISSION = 200
 
@@ -116,6 +121,15 @@ class IncomingCallActivity : AppCompatActivity() {
                 val callerNumber = extractUserNumber(callInvite.from ?: "Unknown")
                 putExtra(EXTRA_CALLER_NAME, callerName)
                 putExtra(EXTRA_CALLER_NUMBER, callerNumber)
+
+                // Extract transfer metadata (present only when this call was transferred)
+                val isTransferred = callInvite.customParameters.containsKey("transfer_host")
+                putExtra(EXTRA_IS_TRANSFERRED, isTransferred)
+                if (isTransferred) {
+                    putExtra(EXTRA_TRANSFER_AGENT_NAME, callInvite.customParameters["user_name"] ?: "")
+                    putExtra(EXTRA_TRANSFER_NOTE, callInvite.customParameters["note"] ?: "")
+                    putExtra(EXTRA_TRANSFER_CONTACT_NUMBER, callInvite.customParameters["contact_number"] ?: "")
+                }
             }
         }
 
@@ -130,8 +144,27 @@ class IncomingCallActivity : AppCompatActivity() {
     private var callSid: String? = null
     private var callerName: String? = null
     private var callerNumber: String? = null
-    private var myNumber: String? = null  // The number receiving the call (to)
+    private var myNumber: String? = null  // Twilio client identity that received the call (callInvite.to)
+    /**
+     * The real E.164 phone number that the caller dialled — i.e. *our* phone number
+     * as it appears in the backend's phone-numbers table.
+     *
+     * Background: Twilio sets [callInvite.to] to the Twilio client identity string
+     * (e.g. "client:fayiz_e1772527748"), NOT the actual DID/phone number. The
+     * backend injects the real number as a custom parameter ["callee"] so that
+     * features like transfer-call can send `from=<real phone number>` to the API
+     * without a separate lookup.
+     *
+     * Example: customParameters=[callee=+16076021951, client_name=Cy one FN, ...]
+     */
+    private var myCalleeNumber: String? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // Transfer call state
+    private var isTransferred: Boolean = false
+    private var transferAgentName: String? = null
+    private var transferNote: String? = null
+    private var transferContactNumber: String? = null
     
     // Call waiting state - active call info when this is a second incoming call
     private var hasActiveCall = false
@@ -402,15 +435,35 @@ class IncomingCallActivity : AppCompatActivity() {
         callSid = intent.getStringExtra(EXTRA_CALL_SID)
         callerName = intent.getStringExtra(EXTRA_CALLER_NAME) ?: "Unknown"
         callerNumber = intent.getStringExtra(EXTRA_CALLER_NUMBER) ?: ""
-        
-        // Extract the "to" number (the number receiving the call)
+
+        // Log all customParameters so we can see what the backend sends
+        val customParamsLog = callInvite?.customParameters
+            ?.entries
+            ?.joinToString(", ") { "${it.key}=${it.value}" }
+            ?: "null"
+        android.util.Log.d(TAG, "onCreate: callInvite.customParameters=[$customParamsLog]")
+
+        // Extract the "to" identity (Twilio client identity, e.g. "client:fayiz_...").
+        // This is NOT a phone number — it is only used internally to identify the agent.
         myNumber = callInvite?.to ?: ""
-        
+
+        // Extract the real E.164 phone number for this agent from the backend-injected
+        // custom parameter "callee" (e.g. "+16076021951").
+        // This is the number we must pass as `from` in the transfer-call API.
+        myCalleeNumber = callInvite?.customParameters?.get("callee")?.takeIf { it.isNotBlank() }
+        android.util.Log.d(TAG, "onCreate: myNumber(identity)=$myNumber, myCalleeNumber(E.164)=$myCalleeNumber")
+
         // Get active call info (call waiting scenario)
         hasActiveCall = intent.getBooleanExtra(EXTRA_HAS_ACTIVE_CALL, false)
         activeCallerName = intent.getStringExtra(EXTRA_ACTIVE_CALLER_NAME)
         activeCallerNumber = intent.getStringExtra(EXTRA_ACTIVE_CALLER_NUMBER)
         activeCallHandle = intent.getStringExtra(EXTRA_ACTIVE_CALL_HANDLE)
+
+        // Transfer call metadata
+        isTransferred = intent.getBooleanExtra(EXTRA_IS_TRANSFERRED, false)
+        transferAgentName = intent.getStringExtra(EXTRA_TRANSFER_AGENT_NAME)
+        transferNote = intent.getStringExtra(EXTRA_TRANSFER_NOTE)
+        transferContactNumber = intent.getStringExtra(EXTRA_TRANSFER_CONTACT_NUMBER)
         
         // The PendingIntent extras are baked at notification-creation time.
         // If the active call ended before the user tapped the notification,
@@ -432,6 +485,9 @@ class IncomingCallActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.callerName).text = callerName
         val formattedNumber = formatPhoneNumber(callerNumber)
         findViewById<TextView>(R.id.callerNumber).text = if (formattedNumber.isNotEmpty()) "Mobile  $formattedNumber" else "Mobile"
+
+        // Bind transfer info card
+        bindTransferInfoCard()
 
         // Load Easify logo from Flutter assets using SvgPicture-like approach
         // For now, keep the vector drawable but make it more visible
@@ -1721,6 +1777,8 @@ class IncomingCallActivity : AppCompatActivity() {
             "callerName" to callerName,
             "callerNumber" to callerNumber,
             "myNumber" to myNumber,
+            // Real E.164 DID that was called — used as `from` in transfer-call API
+            "myCalleeNumber" to myCalleeNumber,
             "callSid" to callSid,
             "callDirection" to "incoming",
             "isCallAnswered" to true
@@ -1902,6 +1960,7 @@ class IncomingCallActivity : AppCompatActivity() {
             it.putExtra("CALLER_NAME", callerName)
             it.putExtra("CALLER_NUMBER", callerNumber)
             it.putExtra("MY_NUMBER", myNumber)
+            it.putExtra("MY_CALLEE_NUMBER", myCalleeNumber)
             it.putExtra("CALL_DIRECTION", "incoming")
             startActivity(it)
             android.util.Log.d(TAG, "launchMainActivityForCallWaiting: Brought main activity to front (UNLOCKED path) - caller: $callerName, number: $callerNumber")
@@ -1926,9 +1985,11 @@ class IncomingCallActivity : AppCompatActivity() {
             it.putExtra("CALLER_NAME", callerName)
             it.putExtra("CALLER_NUMBER", callerNumber)
             it.putExtra("MY_NUMBER", myNumber)
+            // Real E.164 DID that was called — used as `from` in transfer-call API
+            it.putExtra("MY_CALLEE_NUMBER", myCalleeNumber)
             it.putExtra("CALL_DIRECTION", "incoming")
             startActivity(it)
-            android.util.Log.d(TAG, "launchMainActivity: Launched with call data (UNLOCKED path) - caller: $callerName, number: $callerNumber, myNumber: $myNumber")
+            android.util.Log.d(TAG, "launchMainActivity: Launched with call data (UNLOCKED path) - caller: $callerName, number: $callerNumber, myNumber: $myNumber, myCalleeNumber: $myCalleeNumber")
         }
     }
 
@@ -2216,6 +2277,46 @@ class IncomingCallActivity : AppCompatActivity() {
             }
             // Default: return original if format doesn't match
             else -> phoneNumber
+        }
+    }
+
+    private fun bindTransferInfoCard() {
+        val card = findViewById<android.view.View>(R.id.transferInfoCard) ?: return
+        if (!isTransferred) {
+            card.visibility = android.view.View.GONE
+            return
+        }
+        card.visibility = android.view.View.VISIBLE
+
+        val agentRow = findViewById<android.view.View>(R.id.transferAgentRow)
+        val agentNameView = findViewById<TextView>(R.id.transferAgentName)
+        val noteRow = findViewById<android.view.View>(R.id.transferNoteRow)
+        val noteView = findViewById<TextView>(R.id.transferNote)
+        val contactRow = findViewById<android.view.View>(R.id.transferContactRow)
+        val contactView = findViewById<TextView>(R.id.transferContactNumber)
+
+        val agentName = transferAgentName?.takeIf { it.isNotEmpty() }
+        if (agentName != null) {
+            agentNameView.text = agentName
+            agentRow.visibility = android.view.View.VISIBLE
+        } else {
+            agentRow.visibility = android.view.View.GONE
+        }
+
+        val note = transferNote?.takeIf { it.isNotEmpty() }
+        if (note != null) {
+            noteView.text = note
+            noteRow.visibility = android.view.View.VISIBLE
+        } else {
+            noteRow.visibility = android.view.View.GONE
+        }
+
+        val contact = transferContactNumber?.takeIf { it.isNotEmpty() }
+        if (contact != null) {
+            contactView.text = contact
+            contactRow.visibility = android.view.View.VISIBLE
+        } else {
+            contactRow.visibility = android.view.View.GONE
         }
     }
 }
