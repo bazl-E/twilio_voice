@@ -45,6 +45,11 @@ class CallSession {
   /// The local user's phone number for this call.
   final String? myNumber;
 
+  /// The real E.164 Twilio DID that received this call.
+  /// Extracted from callInvite.customParameters["callee"] by native.
+  /// For outgoing calls this will be null (outgoing calls use [myNumber] as-is).
+  final String? myCalleeNumber;
+
   /// Profile details fetched for the caller (avatar, company, etc.).
   final Map<String, dynamic>? callerProfileDetails;
 
@@ -66,6 +71,7 @@ class CallSession {
     this.callerName,
     this.callerNumber,
     this.myNumber,
+    this.myCalleeNumber,
     this.callerProfileDetails,
     required this.startedAt,
     required this.direction,
@@ -81,6 +87,7 @@ class CallSession {
     String? callerName,
     String? callerNumber,
     String? myNumber,
+    String? myCalleeNumber,
     Map<String, dynamic>? callerProfileDetails,
     DateTime? startedAt,
     CallDirection? direction,
@@ -97,6 +104,7 @@ class CallSession {
       callerName: callerName ?? this.callerName,
       callerNumber: callerNumber ?? this.callerNumber,
       myNumber: myNumber ?? this.myNumber,
+      myCalleeNumber: myCalleeNumber ?? this.myCalleeNumber,
       callerProfileDetails: clearCallerProfileDetails
           ? null
           : (callerProfileDetails ?? this.callerProfileDetails),
@@ -130,6 +138,7 @@ class CallSession {
           callerName == other.callerName &&
           callerNumber == other.callerNumber &&
           myNumber == other.myNumber &&
+          myCalleeNumber == other.myCalleeNumber &&
           startedAt == other.startedAt &&
           direction == other.direction &&
           isMuted == other.isMuted;
@@ -143,6 +152,7 @@ class CallSession {
       callerName.hashCode ^
       callerNumber.hashCode ^
       myNumber.hashCode ^
+      myCalleeNumber.hashCode ^
       startedAt.hashCode ^
       direction.hashCode ^
       isMuted.hashCode;
