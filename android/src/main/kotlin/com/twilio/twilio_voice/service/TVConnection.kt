@@ -242,7 +242,19 @@ open class TVCallConnection(
     
     // Flag to track if we're currently on Bluetooth (to detect disconnect)
     private var wasOnBluetooth = false
-    
+
+    // Tracks the current mute state so onCallEndpointChanged can pass it to
+    // the synthetic CallAudioState instead of hardcoding false.
+    // Updated by onMuteStateChanged (API 34+) and onCallAudioStateChanged (pre-34).
+    private var currentMuteState: Boolean = false
+
+    // Set when a user-initiated audio route change (toggleSpeaker/toggleBluetooth) is in
+    // progress on API 34+. Calling requestCallEndpointChange() causes Android to fire
+    // onMuteStateChanged(false) spuriously even when the call is still muted — same
+    // behaviour as the STATE_HOLDING spurious unmute. This flag suppresses that event
+    // until onCallEndpointChanged confirms the new route, at which point it is cleared.
+    private var suppressMuteDuringRouteChange = false
+
     // Flag to ignore the initial callback firing when callback is first registered
     private var ignoreInitialAudioDeviceCallback = true
     
@@ -1612,8 +1624,31 @@ open class TVCallConnection(
         Log.d(TAG, "onCallAudioStateChanged: onCallAudioStateChanged ${state.toString()}")
         super.onCallAudioStateChanged(state)
 
+        if (state == null) return
+
+        // On API 34+, onMuteStateChanged() is the authoritative source for mute state.
+        // We use Twilio SDK mute (not TelecomManager.setMuted()), so the Telecom
+        // framework always reports CallAudioState.isMuted=false regardless of whether
+        // the user has muted the call. If we trust state.isMuted here, every audio route
+        // change (speaker/bluetooth) fires a spurious Unmute event to Flutter.
+        // Solution: only update currentMuteState on pre-34 (where onMuteStateChanged
+        // is not available), and always broadcast with currentMuteState on API 34+.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            currentMuteState = state.isMuted
+        }
+
+        // On API 34+, substitute currentMuteState into the broadcast so the plugin's
+        // handleBroadcastIntent sees the correct mute value and does not fire a
+        // spurious Unmute event when the audio route changes.
+        val broadcastState = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            @Suppress("DEPRECATION")
+            CallAudioState(currentMuteState, state.route, state.supportedRouteMask)
+        } else {
+            state
+        }
+
         Intent(TVBroadcastReceiver.ACTION_AUDIO_STATE).apply {
-            putExtra(TVBroadcastReceiver.EXTRA_AUDIO_STATE, state)
+            putExtra(TVBroadcastReceiver.EXTRA_AUDIO_STATE, broadcastState)
         }.also {
             sendBroadcast(context, it)
         }
@@ -1633,6 +1668,8 @@ open class TVCallConnection(
      */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     override fun onCallEndpointChanged(callEndpoint: CallEndpoint) {
+        // Clear the route-change suppression flag now that Android has confirmed the new endpoint.
+        suppressMuteDuringRouteChange = false
         Log.d(TAG, "onCallEndpointChanged: endpoint=${callEndpoint.endpointName}, type=${callEndpoint.endpointType}")
         super.onCallEndpointChanged(callEndpoint)
 
@@ -1649,10 +1686,12 @@ open class TVCallConnection(
         // Track Bluetooth state for toggleBluetooth early-return optimization
         wasOnBluetooth = callEndpoint.endpointType == CallEndpoint.TYPE_BLUETOOTH
 
-        // Build a CallAudioState to broadcast — this is what TwilioVoicePlugin.handleBroadcastIntent expects
+        // Build a CallAudioState to broadcast — this is what TwilioVoicePlugin.handleBroadcastIntent expects.
+        // Use currentMuteState (updated by onMuteStateChanged) so the broadcast does not
+        // inadvertently reset isMuted to false when the audio route changes.
         @Suppress("DEPRECATION")
         val syntheticAudioState = CallAudioState(
-            false, // mute state is handled separately by onMuteStateChanged
+            currentMuteState, // preserve actual mute state; onMuteStateChanged handles mute-only changes
             route,
             route // supportedRouteMask — simplified, actual available routes tracked by availableCallEndpoints
         )
@@ -1690,8 +1729,18 @@ open class TVCallConnection(
      */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     override fun onMuteStateChanged(isMuted: Boolean) {
-        Log.d(TAG, "onMuteStateChanged: isMuted=$isMuted, connectionState=$state")
+        Log.d(TAG, "onMuteStateChanged: isMuted=$isMuted, connectionState=$state, suppressMuteDuringRouteChange=$suppressMuteDuringRouteChange")
         super.onMuteStateChanged(isMuted)
+
+        // Suppress spurious Android-generated unmute during audio route change.
+        // On API 34+, calling requestCallEndpointChange() causes Android to fire
+        // onMuteStateChanged(false) even though the Twilio call is still muted —
+        // exactly the same spurious-unmute behaviour as STATE_HOLDING. This flag is
+        // set in toggleSpeaker/toggleBluetooth and cleared in onCallEndpointChanged.
+        if (suppressMuteDuringRouteChange && !isMuted) {
+            Log.d(TAG, "onMuteStateChanged: SUPPRESSED — audio route change pending, preserving currentMuteState=$currentMuteState")
+            return
+        }
 
         // Suppress OS-triggered mute state changes while connection is held.
         // The OS fires onMuteStateChanged(false) when a connection enters
@@ -1702,6 +1751,11 @@ open class TVCallConnection(
             Log.d(TAG, "onMuteStateChanged: SUPPRESSED — connection is held (STATE_HOLDING), ignoring OS-triggered mute change")
             return
         }
+
+        // Only update currentMuteState AFTER all suppression checks.
+        // Moving this below the guards ensures a suppressed false event never
+        // corrupts the state used by onCallEndpointChanged's synthetic CallAudioState.
+        currentMuteState = isMuted
 
         // Broadcast mute state change using the same mechanism
         onEvent?.onChange(TVNativeCallEvents.EVENT_MUTE, Bundle().apply {
@@ -1769,9 +1823,11 @@ open class TVCallConnection(
         twilioCall?.let {
             it.mute(newState)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                // API 34+: onMuteStateChanged() will fire automatically from the system
-                // when the mute state changes. We also emit directly for immediate UI update.
-                Log.d(TAG, "toggleMute: API 34+ — muted via Twilio SDK, onMuteStateChanged will fire")
+                // API 34+: Twilio SDK mute bypasses TelecomManager, so onMuteStateChanged()
+                // does NOT fire. Update currentMuteState here so onCallAudioStateChanged()
+                // broadcasts the correct mute state when the audio route changes later.
+                currentMuteState = newState
+                Log.d(TAG, "toggleMute: API 34+ — muted via Twilio SDK, currentMuteState=$currentMuteState")
                 onEvent?.onChange(TVNativeCallEvents.EVENT_MUTE, Bundle().apply {
                     putBoolean(TVBroadcastReceiver.EXTRA_CALL_MUTE_STATE, newState)
                     putString(TVBroadcastReceiver.EXTRA_CALL_HANDLE, callParams?.callSid)
@@ -1826,16 +1882,19 @@ open class TVCallConnection(
                 val targetEndpoint = endpoints.firstOrNull { it.endpointType == targetType }
                 if (targetEndpoint != null) {
                     Log.d(TAG, "toggleSpeaker: API 34+ requestCallEndpointChange to ${targetEndpoint.endpointName} (type=$targetType)")
+                    suppressMuteDuringRouteChange = true
                     requestCallEndpointChange(targetEndpoint, { it.run() }, object : android.os.OutcomeReceiver<Void?, android.telecom.CallEndpointException> {
                         override fun onResult(result: Void?) {
                             Log.d(TAG, "toggleSpeaker: requestCallEndpointChange succeeded")
                         }
                         override fun onError(error: android.telecom.CallEndpointException) {
                             Log.e(TAG, "toggleSpeaker: requestCallEndpointChange failed: ${error.message}")
+                            suppressMuteDuringRouteChange = false
                         }
                     })
                 } else {
                     Log.w(TAG, "toggleSpeaker: No endpoint of type $targetType found in ${endpoints.map { it.endpointType }}, falling back to setAudioRoute")
+                    suppressMuteDuringRouteChange = true
                     @Suppress("DEPRECATION")
                     if (newState) setAudioRoute(CallAudioState.ROUTE_SPEAKER) else setAudioRoute(CallAudioState.ROUTE_WIRED_OR_EARPIECE)
                 }
@@ -1975,16 +2034,19 @@ open class TVCallConnection(
                 val targetEndpoint = endpoints.firstOrNull { it.endpointType == targetType }
                 if (targetEndpoint != null) {
                     Log.d(TAG, "toggleBluetooth: API 34+ requestCallEndpointChange to ${targetEndpoint.endpointName} (type=$targetType)")
+                    suppressMuteDuringRouteChange = true
                     requestCallEndpointChange(targetEndpoint, { it.run() }, object : android.os.OutcomeReceiver<Void?, android.telecom.CallEndpointException> {
                         override fun onResult(result: Void?) {
                             Log.d(TAG, "toggleBluetooth: requestCallEndpointChange succeeded")
                         }
                         override fun onError(error: android.telecom.CallEndpointException) {
                             Log.e(TAG, "toggleBluetooth: requestCallEndpointChange failed: ${error.message}")
+                            suppressMuteDuringRouteChange = false
                         }
                     })
                 } else {
                     Log.w(TAG, "toggleBluetooth: No endpoint of type $targetType found in ${endpoints.map { it.endpointType }}, falling back to setAudioRoute")
+                    suppressMuteDuringRouteChange = true
                     @Suppress("DEPRECATION")
                     if (newState) setAudioRoute(CallAudioState.ROUTE_BLUETOOTH) else setAudioRoute(CallAudioState.ROUTE_WIRED_OR_EARPIECE)
                 }
