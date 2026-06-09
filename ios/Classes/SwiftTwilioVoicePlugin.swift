@@ -4099,6 +4099,28 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
                 // IMPORTANT: Send as normal LOG event, NOT isError:true.
                 // isError:true wraps in FlutterError which crashes the Dart event stream.
                 self.sendPhoneCallEvents(description: "LOG|End Call Failed: \(error.localizedDescription).", isError: false)
+
+                // FALLBACK: CallKit refused the end transaction — most commonly
+                // error 2 (unknownCallProvider), where the CXProvider that
+                // reported this call has been invalidated or a different provider
+                // instance reported it (a zombie call, common after transfers or
+                // in multi-provider setups). CallKit cannot end a call whose
+                // provider it no longer recognises, so without this fallback the
+                // End button does nothing and the active call screen stays stuck.
+                //
+                // Disconnect the underlying Twilio call directly. userInitiatedDisconnect
+                // was already set to true in the hangUp handler, so callDidDisconnect
+                // skips the CallKit end-report and emits "Call Ended" to Flutter,
+                // which tears down the active call screen.
+                let twilioCall = self.calls[uuid] ?? self.call
+                if let twilioCall = twilioCall {
+                    self.userInitiatedDisconnect = true
+                    self.sendPhoneCallEvents(description: "LOG|CallKit end failed — disconnecting Twilio call directly, sid=\(twilioCall.sid)", isError: false)
+                    twilioCall.disconnect()
+                } else if self.calls.isEmpty && self.callInvites.isEmpty {
+                    // No Twilio call object to disconnect — force the UI to end.
+                    self.sendPhoneCallEvents(description: "Call Ended|\(uuid.uuidString)", isError: false)
+                }
             } else {
                 // Don't send "Call Ended" here - let callDidDisconnect handle it
                 // It will check if other calls remain before sending
