@@ -317,6 +317,16 @@ class TVConnectionService : ConnectionService() {
          * Action used to poll the ConnectionService for the active call handle.
          */
         const val ACTION_ACTIVE_HANDLE: String = "ACTION_ACTIVE_HANDLE"
+
+        /**
+         * Action used to tear down a STALE foreground service + ongoing-call
+         * notification left behind after an aggressive OEM (OPPO/MIUI) force-kills
+         * the app mid-call. On restart the system can re-post the ongoing
+         * notification even though the call (and the in-process [activeConnections]
+         * map) is gone — a "phantom". Sent from the app on cold start once Flutter
+         * confirms there is no active call. A no-op if a real call exists.
+         */
+        const val ACTION_CLEANUP_IF_IDLE: String = "ACTION_CLEANUP_IF_IDLE"
         //endregion
 
         //region EXTRA_* Constants
@@ -867,6 +877,19 @@ class TVConnectionService : ConnectionService() {
     // WakeLock to keep CPU awake during incoming call
     private var wakeLock: PowerManager.WakeLock? = null
     private var incomingCallWakeLock: PowerManager.WakeLock? = null
+
+    // WakeLock held for the WHOLE duration of a connected call. The incoming wake
+    // locks above are short-lived (60s) and only cover the ringing phase. Without a
+    // call-duration lock, aggressive OEMs (Oppo/ColorOS, MIUI) deprioritise the
+    // process once the screen turns off or the app leaves the foreground, which can
+    // freeze the WebRTC media that runs in THIS process. Acquired in
+    // [showOngoingCallNotification], released once there are no active calls.
+    private var inCallWakeLock: PowerManager.WakeLock? = null
+
+    // The most recently built ongoing-call notification. Cached so [onTaskRemoved]
+    // can re-assert the foreground service (re-using the exact same notification)
+    // when the user swipes the app from recents while a call is still connected.
+    private var lastOngoingNotification: Notification? = null
     
     // Ringtone and vibration for incoming calls
     private var ringtone: Ringtone? = null
@@ -1004,6 +1027,46 @@ class TVConnectionService : ConnectionService() {
             incomingCallWakeLock = null
         } catch (e: Exception) {
             Log.w(TAG, "[VoiceConnectionService] Failed to release wake lock: $e")
+        }
+    }
+
+    /**
+     * Acquire a partial wake lock that lasts for the entire connected call. Idempotent:
+     * if a lock is already held, this is a no-op. Released by [releaseInCallWakeLock]
+     * when the last call ends (see [stopForegroundService] / [cancelOngoingCallNotification]).
+     */
+    @SuppressLint("WakelockTimeout")
+    private fun acquireInCallWakeLock() {
+        try {
+            if (inCallWakeLock?.isHeld == true) return
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            inCallWakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "TwilioVoice:InCallWakeLock"
+            ).apply {
+                setReferenceCounted(false)
+                // No timeout — a call can run for hours. Release is guaranteed by every
+                // call-end funnel (stopForegroundService / cancelOngoingCallNotification),
+                // and the kernel releases it automatically if the process is killed.
+                acquire()
+            }
+            Log.d(TAG, "[VoiceConnectionService] In-call wake lock acquired")
+        } catch (e: Exception) {
+            Log.w(TAG, "[VoiceConnectionService] Failed to acquire in-call wake lock: $e")
+        }
+    }
+
+    private fun releaseInCallWakeLock() {
+        try {
+            inCallWakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.d(TAG, "[VoiceConnectionService] In-call wake lock released")
+                }
+            }
+            inCallWakeLock = null
+        } catch (e: Exception) {
+            Log.w(TAG, "[VoiceConnectionService] Failed to release in-call wake lock: $e")
         }
     }
 
@@ -2088,10 +2151,117 @@ class TVConnectionService : ConnectionService() {
             }
         } ?: run {
             Log.e(TAG, "onStartCommand: intent is null")
+            // START_STICKY redelivers a null intent when the system restarts the
+            // service after the process was killed (e.g. an aggressive OEM like
+            // Poco/OPPO killing the app mid-call). The static activeConnections
+            // map died with the process, so there is no real call backing any
+            // foreground/ongoing-call notification. Tear it all down so we don't
+            // leave a "phantom" ongoing-call notification that does nothing when
+            // tapped.
+            if (!hasActiveCalls()) {
+                Log.d(TAG, "onStartCommand: null-intent restart with no active calls — clearing phantom ongoing-call state")
+                stopForegroundService()
+                stopSelf()
+                return START_NOT_STICKY
+            }
         }
         return START_STICKY
     }
     //endregion
+
+    /**
+     * Called when the user swipes the app away from the recent-apps screen.
+     *
+     * Product decision (branch sb/call-end-on-terminate): swiping the app away /
+     * terminating it should END any active call rather than keep it alive. Plain
+     * backgrounding (screen off, switching apps) still keeps the call running via
+     * the foreground service + in-call wake lock — only an explicit task removal
+     * tears the call down here.
+     *
+     * Because the Twilio Call objects live in THIS (still-alive) process via the
+     * static [activeConnections] map, we can disconnect each one cleanly
+     * (twilioCall.disconnect() through forceDisconnectWithLogging()) so Twilio's
+     * servers drop the leg and the far end hears the call end immediately — instead
+     * of lingering until a media timeout.
+     *
+     * NOTE: this only covers the swipe-from-recents case, where onTaskRemoved is
+     * still delivered while the process is alive (the manifest keeps
+     * android:stopWithTask="false" so we get this callback). A hard force-stop /
+     * OEM battery kill destroys the process without any callback, so the only fully
+     * reliable way to end the leg in that case is a server-side timeout — out of
+     * scope for the client.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.d(TAG, "[VoiceConnectionService] onTaskRemoved: app removed from recents (hasActiveCalls=${hasActiveCalls()})")
+        if (hasActiveCalls()) {
+            try {
+                // Snapshot the handles first — forceDisconnectWithLogging() mutates
+                // activeConnections via its disconnect callbacks (ConcurrentModification otherwise).
+                val handles = activeConnections.keys.toList()
+                Log.d(TAG, "[VoiceConnectionService] onTaskRemoved: ending ${handles.size} active call(s) on app termination: $handles")
+                for (handle in handles) {
+                    // Remove BEFORE disconnecting so hasActiveCalls() reflects the true
+                    // state during the disconnect callbacks (mirrors the ACTION_HANGUP path).
+                    val connection = activeConnections.remove(handle)
+                    if (connection != null) {
+                        try {
+                            connection.forceDisconnectWithLogging()
+                            // Best-effort notify Flutter (no-op if the engine is already gone).
+                            // Mirror the ACTION_HANGUP convention: while other legs are still
+                            // being torn down send HELD_CALL_ENDED (so the session manager drops
+                            // just that leg); send CALL_ENDED for the final leg.
+                            if (hasActiveCalls()) {
+                                sendBroadcastEvent(applicationContext, TVBroadcastReceiver.ACTION_HELD_CALL_ENDED, handle, Bundle().apply {
+                                    putString(TVBroadcastReceiver.EXTRA_CALL_HANDLE, handle)
+                                })
+                            } else {
+                                sendBroadcastEvent(applicationContext, TVBroadcastReceiver.ACTION_CALL_ENDED, handle, connection.extras)
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "[VoiceConnectionService] onTaskRemoved: failed to disconnect $handle: ${e.message}")
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "[VoiceConnectionService] onTaskRemoved: error ending active calls: ${e.message}")
+            } finally {
+                clearCallWaitingState()
+                clearPendingIncomingCall()
+                cancelOngoingCallNotification()
+                stopForegroundService()
+                stopSelfSafe()
+            }
+        } else {
+            // No active call — clean up so we don't leave a dangling service/notification.
+            stopForegroundService()
+            stopSelf()
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
+    /**
+     * Last-chance safety net: if the system destroys the service while calls are
+     * still active WITHOUT delivering [onTaskRemoved] (some OEMs stop a foreground
+     * service directly on swipe), disconnect the Twilio leg(s) while this process is
+     * still alive so the far end isn't left connected to a dead call. Guarded by
+     * [hasActiveCalls] so it is a no-op during the normal end-of-call teardown.
+     */
+    override fun onDestroy() {
+        if (hasActiveCalls()) {
+            Log.d(TAG, "[VoiceConnectionService] onDestroy with active calls — disconnecting Twilio leg(s) before teardown")
+            val handles = activeConnections.keys.toList()
+            for (handle in handles) {
+                val connection = activeConnections.remove(handle)
+                try {
+                    connection?.forceDisconnectWithLogging()
+                } catch (e: Exception) {
+                    Log.w(TAG, "[VoiceConnectionService] onDestroy: failed to disconnect $handle: ${e.message}")
+                }
+            }
+            releaseInCallWakeLock()
+        }
+        super.onDestroy()
+    }
 
     override fun onCreateIncomingConnection(connectionManagerPhoneAccount: PhoneAccountHandle?, request: ConnectionRequest?): Connection {
         assert(request != null) { "ConnectionRequest cannot be null" }
@@ -3114,6 +3284,9 @@ class TVConnectionService : ConnectionService() {
         stopOngoingCallDurationUpdater()
         // Clear all stored call start times since all calls are ending
         callStartTimes.clear()
+        // All calls are ending — drop the call-duration wake lock and cached notification.
+        releaseInCallWakeLock()
+        lastOngoingNotification = null
         try {
             // Use STOP_FOREGROUND_REMOVE to properly remove the foreground notification.
             // Previously used SERVICE_TYPE_MICROPHONE (100) as flags, but 100 doesn't include
@@ -3156,7 +3329,11 @@ class TVConnectionService : ConnectionService() {
     
     private fun showOngoingCallNotification(callSid: String, callerName: String?, heldCallerName: String? = null) {
         Log.d(TAG, "[VoiceConnectionService] showOngoingCallNotification for callSid: $callSid, heldCallerName: $heldCallerName")
-        
+
+        // The call is now connected/ongoing — hold the CPU awake for its whole duration
+        // so the process (which hosts the WebRTC media) is not frozen in the background.
+        acquireInCallWakeLock()
+
         val channel = getOrCreateOngoingCallChannel()
         
         // Create intent to launch main app when notification is tapped
@@ -3225,6 +3402,7 @@ class TVConnectionService : ConnectionService() {
             val notification = buildOngoingCallNotification(
                 displayName, channel, contentIntent, hangupPendingIntent, callStartTime, heldCallerName, swapPendingIntent
             )
+            lastOngoingNotification = notification
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     startForeground(ONGOING_CALL_NOTIFICATION_ID, notification, 
@@ -3249,6 +3427,7 @@ class TVConnectionService : ConnectionService() {
             val notification = buildOngoingCallNotification(
                 displayName, channel, contentIntent, hangupPendingIntent, callStartTime, heldCallerName, swapPendingIntent
             )
+            lastOngoingNotification = notification
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     startForeground(ONGOING_CALL_NOTIFICATION_ID, notification, 
@@ -3606,6 +3785,9 @@ class TVConnectionService : ConnectionService() {
         } else {
             // No other calls remain — safe to fully stop the foreground service.
             Log.d(TAG, "[VoiceConnectionService] cancelOngoingCallNotification - no other calls, stopping foreground")
+            // Drop the call-duration wake lock and cached notification.
+            releaseInCallWakeLock()
+            lastOngoingNotification = null
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     stopForeground(STOP_FOREGROUND_REMOVE)

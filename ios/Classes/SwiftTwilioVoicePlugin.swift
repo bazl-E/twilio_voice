@@ -688,8 +688,29 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
         // CallKit has an odd API contract where the developer must call invalidate or the CXProvider is leaked.
         callKitProvider.invalidate()
     }
-    
-    
+
+    /// Best-effort: end any active Twilio call(s) when the app is terminated so the
+    /// far end isn't left connected to a dead leg. iOS forwards this through the
+    /// Flutter app-delegate chain (registrar.addApplicationDelegate below).
+    ///
+    /// LIMITATION: iOS does NOT reliably deliver applicationWillTerminate when the
+    /// user swipe-kills a *suspended* app. During an active VoIP call the app is
+    /// running (voip background mode) so this usually fires, but a true hard-kill can
+    /// still skip it — in which case the leg only ends via Twilio's server-side
+    /// timeout. call.disconnect() notifies Twilio so the remote party's call ends.
+    @objc public func applicationWillTerminate(_ application: UIApplication) {
+        if calls.isEmpty && callInvites.isEmpty { return }
+        NSLog("TwilioVoice: applicationWillTerminate — ending \(calls.count) active call(s), rejecting \(callInvites.count) invite(s)")
+        userInitiatedDisconnect = true
+        for (_, call) in calls {
+            call.disconnect()
+        }
+        for (_, callInvite) in callInvites {
+            callInvite.reject()
+        }
+    }
+
+
     public static func register(with registrar: FlutterPluginRegistrar) {
         let instance = SwiftTwilioVoicePlugin()
         let methodChannel = FlutterMethodChannel(name: "twilio_voice/messages", binaryMessenger: registrar.messenger())
