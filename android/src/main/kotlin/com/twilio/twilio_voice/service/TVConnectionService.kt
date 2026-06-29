@@ -885,11 +885,6 @@ class TVConnectionService : ConnectionService() {
     // freeze the WebRTC media that runs in THIS process. Acquired in
     // [showOngoingCallNotification], released once there are no active calls.
     private var inCallWakeLock: PowerManager.WakeLock? = null
-
-    // The most recently built ongoing-call notification. Cached so [onTaskRemoved]
-    // can re-assert the foreground service (re-using the exact same notification)
-    // when the user swipes the app from recents while a call is still connected.
-    private var lastOngoingNotification: Notification? = null
     
     // Ringtone and vibration for incoming calls
     private var ringtone: Ringtone? = null
@@ -2225,6 +2220,12 @@ class TVConnectionService : ConnectionService() {
             } catch (e: Exception) {
                 Log.w(TAG, "[VoiceConnectionService] onTaskRemoved: error ending active calls: ${e.message}")
             } finally {
+                // Also stop any incoming-call ringtone/vibration and release the
+                // incoming wake lock — covers swiping the app away while a call is
+                // still RINGING: forceDisconnectWithLogging() rejects the invite but
+                // does NOT stop the service-level ringtone. No-op for connected calls.
+                cancelIncomingCallNotification()
+                releaseWakeLock()
                 clearCallWaitingState()
                 clearPendingIncomingCall()
                 cancelOngoingCallNotification()
@@ -3284,9 +3285,8 @@ class TVConnectionService : ConnectionService() {
         stopOngoingCallDurationUpdater()
         // Clear all stored call start times since all calls are ending
         callStartTimes.clear()
-        // All calls are ending — drop the call-duration wake lock and cached notification.
+        // All calls are ending — drop the call-duration wake lock.
         releaseInCallWakeLock()
-        lastOngoingNotification = null
         try {
             // Use STOP_FOREGROUND_REMOVE to properly remove the foreground notification.
             // Previously used SERVICE_TYPE_MICROPHONE (100) as flags, but 100 doesn't include
@@ -3402,7 +3402,6 @@ class TVConnectionService : ConnectionService() {
             val notification = buildOngoingCallNotification(
                 displayName, channel, contentIntent, hangupPendingIntent, callStartTime, heldCallerName, swapPendingIntent
             )
-            lastOngoingNotification = notification
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     startForeground(ONGOING_CALL_NOTIFICATION_ID, notification, 
@@ -3427,7 +3426,6 @@ class TVConnectionService : ConnectionService() {
             val notification = buildOngoingCallNotification(
                 displayName, channel, contentIntent, hangupPendingIntent, callStartTime, heldCallerName, swapPendingIntent
             )
-            lastOngoingNotification = notification
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     startForeground(ONGOING_CALL_NOTIFICATION_ID, notification, 
@@ -3785,9 +3783,8 @@ class TVConnectionService : ConnectionService() {
         } else {
             // No other calls remain — safe to fully stop the foreground service.
             Log.d(TAG, "[VoiceConnectionService] cancelOngoingCallNotification - no other calls, stopping foreground")
-            // Drop the call-duration wake lock and cached notification.
+            // Drop the call-duration wake lock.
             releaseInCallWakeLock()
-            lastOngoingNotification = null
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
