@@ -2187,14 +2187,21 @@ class TVConnectionService : ConnectionService() {
      * scope for the client.
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.d(TAG, "[VoiceConnectionService] onTaskRemoved: app removed from recents (hasActiveCalls=${hasActiveCalls()})")
-        if (hasActiveCalls()) {
+        // Only end calls that are actually CONNECTED (ACTIVE/HOLDING). On aggressive
+        // OEMs (Oppo/ColorOS) a Telecom ConnectionService can receive onTaskRemoved
+        // DURING call setup — the system momentarily reorganizes the app task as the
+        // call (placed via TelecomManager.placeCall()) spins up — and disconnecting a
+        // still-dialing/ringing call there kills it at initiation. So we act only on
+        // connected calls; calls still NEW/DIALING/RINGING are left to finish.
+        val connectedHandles = activeConnections
+            .filter { (_, c) -> c.state == Connection.STATE_ACTIVE || c.state == Connection.STATE_HOLDING }
+            .keys.toList()
+        Log.d(TAG, "[VoiceConnectionService] onTaskRemoved: app removed from recents " +
+            "(connected=${connectedHandles.size}, total=${activeConnections.size})")
+
+        if (connectedHandles.isNotEmpty()) {
             try {
-                // Snapshot the handles first — forceDisconnectWithLogging() mutates
-                // activeConnections via its disconnect callbacks (ConcurrentModification otherwise).
-                val handles = activeConnections.keys.toList()
-                Log.d(TAG, "[VoiceConnectionService] onTaskRemoved: ending ${handles.size} active call(s) on app termination: $handles")
-                for (handle in handles) {
+                for (handle in connectedHandles) {
                     // Remove BEFORE disconnecting so hasActiveCalls() reflects the true
                     // state during the disconnect callbacks (mirrors the ACTION_HANGUP path).
                     val connection = activeConnections.remove(handle)
@@ -2202,9 +2209,8 @@ class TVConnectionService : ConnectionService() {
                         try {
                             connection.forceDisconnectWithLogging()
                             // Best-effort notify Flutter (no-op if the engine is already gone).
-                            // Mirror the ACTION_HANGUP convention: while other legs are still
-                            // being torn down send HELD_CALL_ENDED (so the session manager drops
-                            // just that leg); send CALL_ENDED for the final leg.
+                            // Mirror the ACTION_HANGUP convention: while other legs remain send
+                            // HELD_CALL_ENDED; send CALL_ENDED for the final leg.
                             if (hasActiveCalls()) {
                                 sendBroadcastEvent(applicationContext, TVBroadcastReceiver.ACTION_HELD_CALL_ENDED, handle, Bundle().apply {
                                     putString(TVBroadcastReceiver.EXTRA_CALL_HANDLE, handle)
@@ -2220,49 +2226,36 @@ class TVConnectionService : ConnectionService() {
             } catch (e: Exception) {
                 Log.w(TAG, "[VoiceConnectionService] onTaskRemoved: error ending active calls: ${e.message}")
             } finally {
-                // Also stop any incoming-call ringtone/vibration and release the
-                // incoming wake lock — covers swiping the app away while a call is
-                // still RINGING: forceDisconnectWithLogging() rejects the invite but
-                // does NOT stop the service-level ringtone. No-op for connected calls.
-                cancelIncomingCallNotification()
-                releaseWakeLock()
-                clearCallWaitingState()
-                clearPendingIncomingCall()
-                cancelOngoingCallNotification()
-                stopForegroundService()
-                stopSelfSafe()
+                // Only tear the service down if NO calls remain — never kill a call that
+                // is still connecting (mid-setup guard above).
+                if (!hasActiveCalls()) {
+                    cancelIncomingCallNotification()
+                    releaseWakeLock()
+                    clearCallWaitingState()
+                    clearPendingIncomingCall()
+                    cancelOngoingCallNotification()
+                    stopForegroundService()
+                    stopSelfSafe()
+                }
             }
-        } else {
-            // No active call — clean up so we don't leave a dangling service/notification.
+        } else if (!hasActiveCalls()) {
+            // No calls at all — clean up so we don't leave a dangling service/notification.
             stopForegroundService()
             stopSelf()
+        } else {
+            // Calls exist but none are connected yet (NEW/DIALING/RINGING) — most likely
+            // a spurious task-removal during call setup on Oppo/ColorOS. Do NOT disconnect
+            // or tear down; let the call finish connecting.
+            Log.d(TAG, "[VoiceConnectionService] onTaskRemoved: only mid-setup call(s) present — leaving them to connect")
         }
         super.onTaskRemoved(rootIntent)
     }
 
-    /**
-     * Last-chance safety net: if the system destroys the service while calls are
-     * still active WITHOUT delivering [onTaskRemoved] (some OEMs stop a foreground
-     * service directly on swipe), disconnect the Twilio leg(s) while this process is
-     * still alive so the far end isn't left connected to a dead call. Guarded by
-     * [hasActiveCalls] so it is a no-op during the normal end-of-call teardown.
-     */
-    override fun onDestroy() {
-        if (hasActiveCalls()) {
-            Log.d(TAG, "[VoiceConnectionService] onDestroy with active calls — disconnecting Twilio leg(s) before teardown")
-            val handles = activeConnections.keys.toList()
-            for (handle in handles) {
-                val connection = activeConnections.remove(handle)
-                try {
-                    connection?.forceDisconnectWithLogging()
-                } catch (e: Exception) {
-                    Log.w(TAG, "[VoiceConnectionService] onDestroy: failed to disconnect $handle: ${e.message}")
-                }
-            }
-            releaseInCallWakeLock()
-        }
-        super.onDestroy()
-    }
+    // NOTE: deliberately NO onDestroy() override. A Telecom ConnectionService's
+    // onDestroy fires during the normal bind/unbind lifecycle — including DURING call
+    // setup on aggressive OEMs (Oppo/ColorOS) — so disconnecting active calls there
+    // tears the call down the moment it is initiated. onTaskRemoved (above) is the
+    // genuine "app swiped/terminated" signal and does not fire during init.
 
     override fun onCreateIncomingConnection(connectionManagerPhoneAccount: PhoneAccountHandle?, request: ConnectionRequest?): Connection {
         assert(request != null) { "ConnectionRequest cannot be null" }
