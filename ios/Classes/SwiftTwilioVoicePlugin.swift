@@ -1051,6 +1051,40 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
             self.isConferenceMode = isConference
             result(true)
         }
+        else if flutterCall.method == "updateCallKitCallerName" {
+            // Re-report the call to CallKit with the CRM-resolved contact name.
+            // CallKit applies the updated localizedCallerName to the in-call UI
+            // AND records it in the native Phone app's Recents entry (which is
+            // written from the last-reported values when the call ends). Dart
+            // calls this after resolving the caller profile from the Easify
+            // server, so Easify-only contacts get named in the native call log.
+            let trimmedName = (arguments["callerName"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !trimmedName.isEmpty else {
+                result(false)
+                return
+            }
+            // Prefer an exact callSid match (multi-call safety); fall back to
+            // the active call, then any live call, then a pending invite.
+            var uuid: UUID? = nil
+            if let sid = arguments["callSid"] as? String, !sid.isEmpty {
+                uuid = self.calls.first(where: { $0.value.sid == sid })?.key
+                    ?? self.callInvites.first(where: { $0.value.callSid == sid })?.key
+            }
+            if uuid == nil {
+                uuid = self.activeCallUUID ?? self.calls.keys.first ?? self.callInvites.keys.first
+            }
+            guard let callUUID = uuid else {
+                self.sendPhoneCallEvents(description: "LOG|updateCallKitCallerName: no live call/invite to update", isError: false)
+                result(false)
+                return
+            }
+            let callUpdate = CXCallUpdate()
+            callUpdate.localizedCallerName = trimmedName
+            self.callKitProvider.reportCall(with: callUUID, updated: callUpdate)
+            self.sendPhoneCallEvents(description: "LOG|updateCallKitCallerName: uuid=\(callUUID) name=\(trimmedName)", isError: false)
+            result(true)
+        }
         else if flutterCall.method == "isHolding" {
             // guard call not nil
             guard let activeCall = self.call else {
@@ -4041,7 +4075,13 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
             
             let callUpdate = CXCallUpdate()
             callUpdate.remoteHandle = callHandle
-            callUpdate.localizedCallerName = self.outgoingCallerName
+            // Use the name Dart passed with makeCall when present; otherwise
+            // fall back to the formatted number (an empty string would leave
+            // Recents showing the raw handle). Dart may later re-report the
+            // CRM-resolved name via `updateCallKitCallerName`.
+            callUpdate.localizedCallerName = self.outgoingCallerName.isEmpty
+                ? self.formatUSPhoneNumber(handle)
+                : self.outgoingCallerName
             callUpdate.supportsDTMF = false
             callUpdate.supportsHolding = true
             callUpdate.supportsGrouping = false
@@ -4058,7 +4098,10 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
         
         let callUpdate = CXCallUpdate()
         callUpdate.remoteHandle = callHandle
-        // If the client is not registered, USE THE THE FROM NUMBER
+        // Report immediately with the formatted number (PushKit requires the
+        // call to be reported synchronously). Dart resolves the contact name
+        // from the CRM and pushes it back via `updateCallKitCallerName`, which
+        // re-reports the call so the ringing UI and Recents show the name.
         callUpdate.localizedCallerName = formatUSPhoneNumber(from)
         callUpdate.supportsDTMF = true
         callUpdate.supportsHolding = true

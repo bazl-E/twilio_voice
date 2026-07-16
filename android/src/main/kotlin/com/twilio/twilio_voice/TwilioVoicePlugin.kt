@@ -2044,31 +2044,41 @@ class TwilioVoicePlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamH
      */
     private fun unregisterForCallInvites(accessToken: String) {
         Log.i(TAG, "Un-registering with FCM")
-        assert(accessToken.isNotEmpty()) { "Twilio Access Token cannot be empty" }
-        assert(fcmToken != null) { "FCM token cannot be null" }
-        fcmToken?.let {
-            val unregistrationListener: UnregistrationListener = object : UnregistrationListener {
-                override fun onUnregistered(accessToken: String?, fcmToken: String?) {
-                    Log.d(TAG, "Successfully un-registered FCM $fcmToken")
-                }
-
-                override fun onError(
-                    registrationException: RegistrationException,
-                    accessToken: String,
-                    fcmToken: String
-                ) {
-                    val message = String.format(
-                        "(un)Registration Error: %d, %s",
-                        registrationException.errorCode,
-                        registrationException.message
-                    )
-                    Log.e(TAG, message)
-                }
-            }
-            Voice.unregister(accessToken, Voice.RegistrationChannel.FCM, it, unregistrationListener)
-        } ?: {
-            Log.e(TAG, "FCM token is null, unable to unregister")
+        // Do NOT use assert() here. Kotlin's assert() throws AssertionError — a
+        // java.lang.Error, not a RuntimeException — when assertions are enabled on
+        // the device. Flutter's MethodChannel handler only catches RuntimeException,
+        // so an AssertionError escapes to the main Looper and crashes the whole app
+        // (the Dart-side try/catch around unregister() never sees it). This runs on
+        // logout from the MPIN lock screen, where the plugin was never registered
+        // this session (fcmToken == null), so guard gracefully and return instead.
+        if (accessToken.isEmpty()) {
+            Log.e(TAG, "Cannot unregister: Twilio access token is empty")
+            return
         }
+        val token = fcmToken
+        if (token == null) {
+            Log.e(TAG, "FCM token is null, unable to unregister (already unregistered or never registered)")
+            return
+        }
+        val unregistrationListener: UnregistrationListener = object : UnregistrationListener {
+            override fun onUnregistered(accessToken: String?, fcmToken: String?) {
+                Log.d(TAG, "Successfully un-registered FCM $fcmToken")
+            }
+
+            override fun onError(
+                registrationException: RegistrationException,
+                accessToken: String,
+                fcmToken: String
+            ) {
+                val message = String.format(
+                    "(un)Registration Error: %d, %s",
+                    registrationException.errorCode,
+                    registrationException.message
+                )
+                Log.e(TAG, message)
+            }
+        }
+        Voice.unregister(accessToken, Voice.RegistrationChannel.FCM, token, unregistrationListener)
     }
 
     //region Flutter ActivityPluginBinding
