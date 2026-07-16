@@ -655,15 +655,6 @@ class MethodChannelTwilioVoice extends TwilioVoicePlatform {
   }
 
   @override
-  Future<bool?> updateCallKitCallerName(String callerName, {String? callSid}) {
-    if (defaultTargetPlatform != TargetPlatform.iOS) return Future.value(false);
-    return _channel.invokeMethod('updateCallKitCallerName', <String, dynamic>{
-      "callerName": callerName,
-      if (callSid != null) "callSid": callSid,
-    });
-  }
-
-  @override
   Future<bool?> setConferenceMetadata({
     required int conferenceId,
     required int gatewayId,

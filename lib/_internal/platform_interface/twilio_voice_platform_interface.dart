@@ -242,15 +242,6 @@ abstract class TwilioVoicePlatform extends SharedPlatformInterface {
   /// at the native level before any notification or UI is shown.
   Future<bool?> setConferenceMode(bool isConference);
 
-  /// iOS-only: re-report the live call to CallKit with the resolved contact
-  /// name so the in-call UI and the native Phone app's Recents entry show the
-  /// name instead of the raw number. Call after resolving the caller's profile
-  /// (calls are initially reported with just the number — PushKit requires an
-  /// immediate report). [callSid] targets a specific call in multi-call
-  /// scenarios; when omitted the active call (or pending invite) is updated.
-  /// Returns false when there is no live call to update. No-op on Android.
-  Future<bool?> updateCallKitCallerName(String callerName, {String? callSid});
-
   /// Send conference metadata to native side for background API calls.
   /// This allows the native side to call the leave participant API when
   /// the host hangs up from notification while the app is killed.
