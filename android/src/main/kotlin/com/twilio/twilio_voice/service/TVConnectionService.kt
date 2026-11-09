@@ -794,6 +794,41 @@ class TVConnectionService : ConnectionService() {
             return activeConnections.isNotEmpty()
         }
 
+        /**
+         * The app keeps one "call in progress" record per gateway in prefs
+         * "easify_active_call_state" (`call_in_progress_<gateway>` = epoch ms),
+         * which the app's FCM gate and the other gateways read so their calls
+         * do not ring over this one. Each gateway writes only its own. Twilio's
+         * own pushes ignore Twilio's record, so call waiting still gets through.
+         */
+        private const val PREFS_ACTIVE_CALL = "easify_active_call_state"
+        private const val KEY_CALL_IN_PROGRESS = "call_in_progress_twilio"
+
+        /**
+         * Writes or removes Twilio's record from the calls actually up:
+         * connected, held or dialling. A ringing invite does not count.
+         *
+         * Recomputed on every connection state change rather than at each of
+         * the many places a connection is added or removed, so it cannot drift.
+         * A fresh process has no connections, which also clears a record left
+         * by a call that died with its process.
+         */
+        fun syncCallInProgress(context: Context) {
+            val inProgress = activeConnections.values.any {
+                it.state == Connection.STATE_ACTIVE ||
+                    it.state == Connection.STATE_HOLDING ||
+                    it.state == Connection.STATE_DIALING
+            }
+            val prefs = context.applicationContext
+                .getSharedPreferences(PREFS_ACTIVE_CALL, Context.MODE_PRIVATE)
+            val recorded = prefs.contains(KEY_CALL_IN_PROGRESS)
+            if (inProgress && !recorded) {
+                prefs.edit().putLong(KEY_CALL_IN_PROGRESS, System.currentTimeMillis()).apply()
+            } else if (!inProgress && recorded) {
+                prefs.edit().remove(KEY_CALL_IN_PROGRESS).apply()
+            }
+        }
+
         //clear active connections
         fun clearActiveConnections() {
             activeConnections.clear()
@@ -2187,6 +2222,18 @@ class TVConnectionService : ConnectionService() {
      * scope for the client.
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
+        // Only the app's own task going away means the user left the app.
+        // Android delivers onTaskRemoved to every running service of the app
+        // for ANY of its tasks, and the call screens run in tasks of their own
+        // (taskAffinity="": the call-waiting sheet, incoming-call screens and
+        // answer trampolines, here and in the other gateways' plugins) and
+        // close with finishAndRemoveTask(). Ending connected calls then dropped
+        // the call the user was keeping — e.g. the first call while answering
+        // a waiting one from the sheet.
+        if (!isAppTaskRemoval(rootIntent)) {
+            super.onTaskRemoved(rootIntent)
+            return
+        }
         // Only end calls that are actually CONNECTED (ACTIVE/HOLDING). On aggressive
         // OEMs (Oppo/ColorOS) a Telecom ConnectionService can receive onTaskRemoved
         // DURING call setup — the system momentarily reorganizes the app task as the
@@ -2249,6 +2296,18 @@ class TVConnectionService : ConnectionService() {
             Log.d(TAG, "[VoiceConnectionService] onTaskRemoved: only mid-setup call(s) present — leaving them to connect")
         }
         super.onTaskRemoved(rootIntent)
+    }
+
+    /**
+     * Whether the removed task is the app's main one (its launcher activity),
+     * the one a swipe from recents removes. An unknown task counts as the app's
+     * so a real swipe is never missed.
+     */
+    private fun isAppTaskRemoval(rootIntent: Intent?): Boolean {
+        val removed = rootIntent?.component ?: return true
+        val launcher = packageManager.getLaunchIntentForPackage(packageName)?.component
+            ?: return true
+        return removed.className == launcher.className
     }
 
     // NOTE: deliberately NO onDestroy() override. A Telecom ConnectionService's
