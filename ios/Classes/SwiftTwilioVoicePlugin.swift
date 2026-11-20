@@ -1288,21 +1288,7 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
             // callKitCallController.request() can land in that empty window: iOS returns
             // "transaction successful" but performStartCallAction is never dispatched.
             if needsProviderReset {
-                let staleProvider = callKitProvider
-                let freshConfig = CXProviderConfiguration(localizedName: SwiftTwilioVoicePlugin.appName)
-                freshConfig.maximumCallGroups = 2
-                freshConfig.maximumCallsPerCallGroup = 1
-                freshConfig.supportedHandleTypes = [.phoneNumber, .generic]
-                // Preserve any custom CallKit icon previously set via updateCallKitIcon()
-                if let savedIconName = UserDefaults.standard.string(forKey: defaultCallKitIcon),
-                   let iconImage = UIImage(named: savedIconName) {
-                    freshConfig.iconTemplateImageData = iconImage.pngData()
-                }
-                callKitProvider = CXProvider(configuration: freshConfig)
-                callKitCallController = CXCallController()
-                callKitProvider.setDelegate(self, queue: nil)  // register fresh FIRST
-                staleProvider.setDelegate(nil, queue: nil)     // then orphan stale — TUCallCenter already updated
-                needsProviderReset = false
+                replaceCallKitProvider()
                 self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: fresh CXProvider created and registered (needsProviderReset was true)", isError: false)
             } else {
                 self.sendPhoneCallEvents(description: "LOG|[Twilio] makeCall: reusing existing CXProvider (sequential Twilio call)", isError: false)
@@ -1490,6 +1476,13 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
         self.sendPhoneCallEvents(description: "LOG|pushRegistry:didReceiveIncomingPushWithPayload:forType:completion:", isError: false)
 
+        // Another gateway's push, handed here by the app's AppDelegate because
+        // a Twilio call is on CallKit (see `hasCallKitCall`): turn it away.
+        if type == .voIP && !Self.isTwilioPush(payload.dictionaryPayload) {
+            turnAwayPushForOtherGateway(payload.dictionaryPayload, completion: completion)
+            return
+        }
+
         // Save for later when the notification is properly handled.
 //        self.incomingPushCompletionCallback = completion
         
@@ -1556,14 +1549,20 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     }
     
     /**
-     * Checks if the device is currently on a non-Twilio (system/cellular) call.
-     * Uses CXCallObserver to get all active calls on the device, then excludes
-     * calls that belong to our app (tracked in `calls` and `callInvites`).
+     * Checks if the device is currently on a non-Twilio call: cellular, or
+     * another gateway's (Vonage, Telnyx, Easify Connect). Uses CXCallObserver
+     * to get all calls on the device, then excludes calls that belong to
+     * Twilio (tracked in `calls` and `callInvites`).
      *
-     * @return true if there is at least one active non-Twilio call on the device
+     * Only a call that is connected or being dialled counts. A call that is
+     * merely ringing does not, so two rings never block each other.
+     *
+     * @return true if there is at least one non-Twilio call in progress
      */
     private func isDeviceOnNonTwilioCall() -> Bool {
-        let allSystemCalls = callObserver.calls.filter { !$0.hasEnded }
+        let allSystemCalls = callObserver.calls.filter {
+            !$0.hasEnded && ($0.hasConnected || $0.isOutgoing)
+        }
 
         // Get all UUIDs that belong to our Twilio calls
         let twilioCallUUIDs = Set(self.calls.keys).union(Set(self.callInvites.keys))
@@ -1586,24 +1585,42 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
          * sent to this device/identity pair.
          */
         UserDefaults.standard.set(Date(), forKey: kCachedBindingDate)
-        
+
         // ============================================================
-        // SYSTEM CALL CHECK: If the device is already on a non-Twilio
-        // system call (cellular/SIM), reject the incoming Twilio call.
+        // FRESH PROVIDER: With no Twilio call or invite up, report this
+        // call through a fresh CXProvider.
+        //
+        // iOS gives an app ONE connection to CallKit, and each provider that
+        // connects replaces the last. Telnyx, Easify Connect and Vonage set up
+        // a provider for each of their calls (and short-lived ones to turn
+        // calls away), and tear it down after, so after any of those this
+        // plugin's long-lived provider is no longer connected — not always
+        // with a notification (`needsProviderReset`) to say so. A call
+        // reported through it still showed and could be "answered", but
+        // CallKit never delivered the answer here, so Twilio never accepted;
+        // when the caller gave up, the end never reached CallKit either. The
+        // app cleared the call; iOS kept it, stuck, until the app was killed.
+        //
+        // Not with a Twilio call up: that call lives on the current provider,
+        // and call waiting must use the same one.
+        // ============================================================
+        if self.calls.isEmpty && self.callInvites.isEmpty {
+            replaceCallKitProvider()
+        }
+
+        // ============================================================
+        // BUSY CHECK: If the device is already on a non-Twilio call
+        // (cellular, or another gateway's), this device does not ring.
         // We still MUST report the call to CallKit (Apple requirement
-        // for PushKit), then immediately end it.
+        // for PushKit), then immediately end it — locally only. The
+        // invite is NOT rejected: a reject ends the call for the user's
+        // other devices too, while left alone it keeps ringing them and
+        // then ends as a missed call (cancelledCallInviteReceived).
         // NOTE: If the active call is from OUR app (Twilio), we allow
         // it through for call waiting support.
         // ============================================================
         if isDeviceOnNonTwilioCall() {
-            self.sendPhoneCallEvents(description: "LOG|callInviteReceived: Device is on a system call - rejecting Twilio incoming call", isError: false)
-            // Must report to CallKit first (Apple PushKit requirement), then immediately end
-            reportIncomingCall(from: callInvite.from ?? defaultCaller, uuid: callInvite.uuid)
-            // Reject the Twilio call invite
-            callInvite.reject()
-            // Tell CallKit the call has ended (more reliable than performEndCallAction)
-            self.callKitProvider.reportCall(with: callInvite.uuid, endedAt: Date(), reason: .declinedElsewhere)
-            self.sendPhoneCallEvents(description: "LOG|callInviteReceived: Twilio call rejected (system call active)", isError: false)
+            reportAndEndImmediately(callInvite)
             return
         }
         // ============================================================
@@ -1616,9 +1633,8 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
         // ============================================================
         if self.isConferenceMode {
             self.sendPhoneCallEvents(description: "LOG|callInviteReceived: Conference call active - rejecting incoming call silently", isError: false)
-            reportIncomingCall(from: callInvite.from ?? defaultCaller, uuid: callInvite.uuid)
             callInvite.reject()
-            self.callKitProvider.reportCall(with: callInvite.uuid, endedAt: Date(), reason: .declinedElsewhere)
+            reportAndEndImmediately(callInvite)
             self.sendPhoneCallEvents(description: "LOG|callInviteReceived: Incoming call rejected (conference active)", isError: false)
             return
         }
@@ -1636,14 +1652,11 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
         // ============================================================
         if self.calls.count >= 2 {
             self.sendPhoneCallEvents(description: "LOG|callInviteReceived: Already have \(self.calls.count) active calls (Call A + Call B) - rejecting 3rd incoming call (Call C)", isError: false)
-            // Step 1: Report to CallKit (Apple PushKit requirement — must report every VoIP push)
-            reportIncomingCall(from: callInvite.from ?? defaultCaller, uuid: callInvite.uuid)
-            // Step 2: Reject the Twilio call invite (only rejects Call C's invite, not A or B)
+            // Reject the Twilio call invite (only rejects Call C's invite, not A or B)
             callInvite.reject()
-            // Step 3: Tell CallKit that Call C has ended (uses Call C's UUID only)
-            // Using reportCall(endedAt:reason:) is more reliable than performEndCallAction
-            // because it doesn't depend on CXCallObserver having registered the call yet
-            self.callKitProvider.reportCall(with: callInvite.uuid, endedAt: Date(), reason: .declinedElsewhere)
+            // Report to CallKit (Apple PushKit requirement — must report every VoIP
+            // push) and end it, with Call C's UUID only
+            reportAndEndImmediately(callInvite)
             self.sendPhoneCallEvents(description: "LOG|callInviteReceived: 3rd call (Call C) rejected and ended — Call A and Call B unaffected", isError: false)
             return
         }
@@ -3833,7 +3846,13 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
     
     public func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         self.sendPhoneCallEvents(description: "LOG|provider:performAnswerCallAction: uuid=\(action.callUUID)", isError: false)
-        
+
+        // A call turned away for another gateway, tapped before it ended
+        if absorbedUUIDs.contains(action.callUUID) {
+            action.fail()
+            return
+        }
+
         // If there's an active call, hold it before answering the new one
         // IMPORTANT: We must send "Hold" to Flutter SYNCHRONOUSLY (before answering)
         // so the BLoC saves Test1's caller data BEFORE the Connected event for Test2
@@ -4052,7 +4071,83 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
         }
     }
     
-    func reportIncomingCall(from: String, uuid: UUID) {
+    /// Replaces this plugin's CXProvider with a fresh, connected one.
+    ///
+    /// Registers the fresh provider FIRST, then orphans the stale one, so there
+    /// is never a moment with no provider connected (see makeCall).
+    private func replaceCallKitProvider() {
+        let staleProvider = callKitProvider
+        let freshConfig = CXProviderConfiguration(localizedName: SwiftTwilioVoicePlugin.appName)
+        freshConfig.maximumCallGroups = 2
+        freshConfig.maximumCallsPerCallGroup = 1
+        freshConfig.supportedHandleTypes = [.phoneNumber, .generic]
+        // Preserve any custom CallKit icon previously set via updateCallKitIcon()
+        if let savedIconName = UserDefaults.standard.string(forKey: defaultCallKitIcon),
+           let iconImage = UIImage(named: savedIconName) {
+            freshConfig.iconTemplateImageData = iconImage.pngData()
+        }
+        callKitProvider = CXProvider(configuration: freshConfig)
+        callKitCallController = CXCallController()
+        callKitProvider.setDelegate(self, queue: nil)  // register fresh FIRST
+        staleProvider.setDelegate(nil, queue: nil)     // then orphan stale — TUCallCenter already updated
+        needsProviderReset = false
+    }
+
+    /// Whether Twilio has a call on CallKit (an invite ringing, or a call).
+    ///
+    /// The app's AppDelegate reads it (by KVC, through TwilioPushBridge) to
+    /// decide who turns away another gateway's push. iOS gives an app one
+    /// connection to CallKit and each new provider replaces the last, so while
+    /// Twilio has a call, Twilio's provider holds it: a call another gateway
+    /// reports lands under this provider, that gateway can neither end nor
+    /// answer it, and only this provider can.
+    @objc public var hasCallKitCall: Bool {
+        return !calls.isEmpty || !callInvites.isEmpty
+    }
+
+    /// Calls reported only to be ended at once (see
+    /// `turnAwayPushForOtherGateway`), so a tap that reaches one before it ends
+    /// is failed rather than answered — answering holds the live call first.
+    private var absorbedUUIDs = Set<UUID>()
+
+    private static func isTwilioPush(_ payload: [AnyHashable: Any]) -> Bool {
+        return payload["twi_call_sid"] != nil || payload["twi_to"] != nil
+            || payload["twi_message_type"] != nil
+    }
+
+    /// Reports another gateway's VoIP push and ends it at once, through this
+    /// plugin's provider, then completes the push. See `hasCallKitCall`.
+    private func turnAwayPushForOtherGateway(_ payload: [AnyHashable: Any], completion: @escaping () -> Void) {
+        let uuid = UUID()
+        absorbedUUIDs.insert(uuid)
+        let caller = (payload["caller"] as? String) ?? defaultCaller
+        reportIncomingCall(from: caller, uuid: uuid) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .declinedElsewhere)
+                completion()
+                // Long enough for a tap already on its way
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self?.absorbedUUIDs.remove(uuid) }
+            }
+        }
+    }
+
+    /// Reports a call iOS requires to be shown (every VoIP push must be) and
+    /// ends it as soon as CallKit has it, so it never rings.
+    ///
+    /// The end must wait for the report: reportNewIncomingCall is asynchronous,
+    /// and an end sent right after it can reach CallKit before the call exists
+    /// there and be dropped — leaving the call ringing on screen, with an
+    /// "End & Accept" that ended the live call for one this plugin never kept.
+    private func reportAndEndImmediately(_ callInvite: CallInvite) {
+        let uuid = callInvite.uuid
+        reportIncomingCall(from: callInvite.from ?? defaultCaller, uuid: uuid) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.callKitProvider.reportCall(with: uuid, endedAt: Date(), reason: .declinedElsewhere)
+            }
+        }
+    }
+
+    func reportIncomingCall(from: String, uuid: UUID, completion: ((Error?) -> Void)? = nil) {
         self.sendPhoneCallEvents(description: "LOG|[Twilio] reportIncomingCall: from=\(from) uuid=\(uuid)", isError: false)
         let callHandle = CXHandle(type: .generic, value: from)
         
@@ -4072,6 +4167,7 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
             } else {
                 self.sendPhoneCallEvents(description: "LOG|Incoming call successfully reported.", isError: false)
             }
+            completion?(error)
         }
     }
     

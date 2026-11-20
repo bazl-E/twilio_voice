@@ -1767,6 +1767,8 @@ open class TVCallConnection(
     override fun onStateChanged(state: Int) {
         super.onStateChanged(state)
         Log.d(TAG, "onStateChanged: $state")
+        // Keep Twilio's "call in progress" record in step with the calls up
+        TVConnectionService.syncCallInProgress(context)
 //        when (state) {
 //            STATE_ACTIVE -> {
 //                Log.d(TAG, "onStateChanged: STATE_ACTIVE")
